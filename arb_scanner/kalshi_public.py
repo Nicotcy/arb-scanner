@@ -19,8 +19,8 @@ class KalshiTopOfBook:
     yes_ask: float | None
     no_bid: float | None
     no_ask: float | None
-    yes_bid_qty: float | None
-    no_bid_qty: float | None
+    yes_bid_qty: int | None
+    no_bid_qty: int | None
 
 
 class KalshiPublicClient:
@@ -98,7 +98,7 @@ class KalshiPublicClient:
         return response.json()
 
 
-def _extract_best_bid(side: Any) -> tuple[float | None, float | None]:
+def _extract_best_bid(side: Any) -> tuple[int | None, int | None]:
     if side is None:
         return None, None
 
@@ -111,8 +111,8 @@ def _extract_best_bid(side: Any) -> tuple[float | None, float | None]:
     if not bids:
         return None, None
 
-    best_price = None
-    best_qty = None
+    best_price: int | None = None
+    best_qty: int | None = None
 
     for bid in bids:
         price = None
@@ -123,6 +123,9 @@ def _extract_best_bid(side: Any) -> tuple[float | None, float | None]:
         elif isinstance(bid, (list, tuple)) and len(bid) >= 2:
             price, qty = bid[0], bid[1]
 
+        price = _coerce_int(price)
+        qty = _coerce_int(qty)
+
         if price is None:
             continue
         if best_price is None or price > best_price:
@@ -132,7 +135,16 @@ def _extract_best_bid(side: Any) -> tuple[float | None, float | None]:
     return best_price, best_qty
 
 
-def _cents_to_dollars(value: float | None) -> float | None:
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cents_to_dollars(value: int | None) -> float | None:
     if value is None:
         return None
     return value / 100
