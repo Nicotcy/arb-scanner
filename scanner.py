@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from arb_scanner.config import load_config
+from arb_scanner.kalshi_public import KalshiPublicClient
 from arb_scanner.scanner import compute_opportunities, format_opportunity_table, summarize_config
 from arb_scanner.sources.stub import StubProvider
 
@@ -31,8 +33,19 @@ def main() -> int:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
     else:
-        provider_a = StubProvider("Kalshi")
-        provider_b = StubProvider("Polymarket")
+        demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
+        client = KalshiPublicClient()
+        markets = list(client.list_open_markets(max_pages=1))
+        tickers = [market.get("ticker") for market in markets if market.get("ticker")]
+        for ticker in tickers[:demo_count]:
+            top = client.fetch_top_of_book(ticker)
+            print(
+                f"{top.ticker} "
+                f"{top.yes_bid} {top.yes_ask} "
+                f"{top.no_bid} {top.no_ask} "
+                f"{top.yes_bid_qty} {top.no_bid_qty}"
+            )
+        return 0
 
     markets_a = list(provider_a.fetch_market_snapshots())
     markets_b = list(provider_b.fetch_market_snapshots())
