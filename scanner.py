@@ -37,9 +37,24 @@ def main() -> int:
 
         print("KALSHI LIVE DEMO (read-only)")
         demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
+        max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "200"))
         max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "500"))
         client = KalshiPublicClient()
         markets = list(client.list_open_markets(max_pages=1))
+        activity_key = None
+        for key in ("volume_24h", "volume", "open_interest"):
+            if any(key in market for market in markets):
+                activity_key = key
+                active_markets = [
+                    market for market in markets if (market.get(key) or 0) > 0
+                ]
+                if active_markets:
+                    markets = sorted(
+                        active_markets,
+                        key=lambda market: market.get(key) or 0,
+                        reverse=True,
+                    )
+                break
         tickers = [market.get("ticker") for market in markets if market.get("ticker")]
         printed = 0
         scanned = 0
@@ -47,6 +62,10 @@ def main() -> int:
             if scanned >= max_scan or printed >= demo_count:
                 break
             scanned += 1
+            try:
+                top = client.fetch_top_of_book(ticker)
+            except Exception:
+                continue
             top = client.fetch_top_of_book(ticker)
             if (
                 (top.yes_bid is None and top.no_bid is None)
