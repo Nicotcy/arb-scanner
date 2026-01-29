@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from arb_scanner.config import load_config
-from arb_scanner.kalshi_public import KalshiPublicClient
 from arb_scanner.scanner import compute_opportunities, format_opportunity_table, summarize_config
 from arb_scanner.sources.stub import StubProvider
 
@@ -33,19 +33,40 @@ def main() -> int:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
     else:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        print("KALSHI LIVE DEMO (read-only)")
         demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
+        max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "500"))
         client = KalshiPublicClient()
         markets = list(client.list_open_markets(max_pages=1))
         tickers = [market.get("ticker") for market in markets if market.get("ticker")]
-        for ticker in tickers[:demo_count]:
+        printed = 0
+        scanned = 0
+        for ticker in tickers:
+            if scanned >= max_scan or printed >= demo_count:
+                break
+            scanned += 1
             top = client.fetch_top_of_book(ticker)
+            if (
+                (top.yes_bid is None and top.no_bid is None)
+                or (top.yes_ask is None and top.no_ask is None)
+            ):
+                continue
             print(
-                f"{top.ticker} "
-                f"{top.yes_bid} {top.yes_ask} "
-                f"{top.no_bid} {top.no_ask} "
-                f"{top.yes_bid_qty} {top.no_bid_qty}"
+                f"{top.ticker} | "
+                f"yes_bid={top.yes_bid} yes_ask={top.yes_ask} "
+                f"no_bid={top.no_bid} no_ask={top.no_ask} "
+                f"qtyY={top.yes_bid_qty} qtyN={top.no_bid_qty}"
             )
-        return 0
+            printed += 1
+        if scanned >= max_scan and printed == 0:
+            print(
+                "No usable markets found in first "
+                f"{max_scan} open markets (no bids)."
+            )
+        print(f"Printed {printed} usable markets (scanned {scanned}).")
+        sys.exit(0)
 
     markets_a = list(provider_a.fetch_market_snapshots())
     markets_b = list(provider_b.fetch_market_snapshots())
