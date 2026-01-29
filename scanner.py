@@ -67,6 +67,7 @@ def main() -> int:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
                 continue
+            top = client.fetch_top_of_book(ticker)
             if (
                 (top.yes_bid is None and top.no_bid is None)
                 or (top.yes_ask is None and top.no_ask is None)
