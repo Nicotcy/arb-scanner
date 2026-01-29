@@ -38,7 +38,6 @@ def main() -> int:
         print("KALSHI LIVE DEMO (read-only)")
         demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
         max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "200"))
-        max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "500"))
         client = KalshiPublicClient()
         markets = list(client.list_open_markets(max_pages=1))
         activity_key = None
@@ -62,6 +61,8 @@ def main() -> int:
             if scanned >= max_scan or printed >= demo_count:
                 break
             scanned += 1
+            if scanned % 5 == 0:
+                print(f"scanned={scanned} printed={printed}")
             try:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
