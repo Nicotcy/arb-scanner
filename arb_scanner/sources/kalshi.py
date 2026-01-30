@@ -23,9 +23,10 @@ class KalshiProvider(MarketDataProvider):
                 max_pages=max_pages, limit_per_page=limit_per_page
             )
         )
+        markets_raw = markets
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
-        markets = [
+        markets_filtered = [
             market
             for market in markets
             if not any(
@@ -37,6 +38,15 @@ class KalshiProvider(MarketDataProvider):
                 for substring in blacklist_substrings
             )
         ]
+        min_after_blacklist = int(os.getenv("KALSHI_MIN_AFTER_BLACKLIST", "50"))
+        if len(markets_filtered) < min_after_blacklist:
+            print(
+                "KalshiProvider: blacklist too aggressive "
+                f"(filtered={len(markets_filtered)} raw={len(markets_raw)}); using raw"
+            )
+            markets = markets_raw
+        else:
+            markets = markets_filtered
         min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
         for key in ("volume_24h", "volume", "open_interest"):
@@ -52,7 +62,6 @@ class KalshiProvider(MarketDataProvider):
                     reverse=True,
                 )
                 break
-                
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
