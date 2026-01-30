@@ -120,6 +120,7 @@ class KalshiProvider(MarketDataProvider):
             f"ok={fetched_ok} "
             f"errors={fetch_errors} "
             f"noasks={no_asks_both_sides} "
+            f"nobids={no_bids_both_sides} "
             f"one_sided={one_sided_only} "
             f"two_sided={two_sided}"
         )
