@@ -39,8 +39,29 @@ def main() -> int:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
     elif args.use_kalshi:
-        provider_a = KalshiProvider()
-        provider_b = KalshiProvider()
+        provider = KalshiProvider()
+        snapshots = list(provider.fetch_market_snapshots())
+        limit = int(os.getenv("KALSHI_SNAPSHOT_N", "20"))
+        print("KALSHI SNAPSHOTS (read-only)")
+        print(f"snapshots={len(snapshots)}")
+        for snapshot in snapshots[:limit]:
+            yes_ask = snapshot.orderbook.best_yes_price
+            no_ask = snapshot.orderbook.best_no_price
+            yes_bid = None if no_ask is None else 1.0 - no_ask
+            no_bid = None if yes_ask is None else 1.0 - yes_ask
+            qty_yes = snapshot.orderbook.best_yes_size
+            qty_no = snapshot.orderbook.best_no_size
+            liquidity = min(qty_yes, qty_no)
+            spread_sum = (yes_ask or 0) + (no_ask or 0)
+            print(
+                f"{snapshot.market.market_id} | "
+                f"yes_ask={yes_ask} no_ask={no_ask} "
+                f"yes_bid={yes_bid} no_bid={no_bid} "
+                f"qtyY={qty_yes} qtyN={qty_no} "
+                f"liquidity={liquidity} "
+                f"spread_sum={spread_sum}"
+            )
+        return 0
     else:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
