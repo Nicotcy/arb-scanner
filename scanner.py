@@ -50,20 +50,36 @@ def main() -> int:
                 max_pages=max_pages, limit_per_page=limit_per_page
             )
         )
+        blacklist_prefixes = ("KXMVESPORTS",)
+        blacklist_substrings = ("MULTIGAMEEXTENDED",)
+        markets = [
+            market
+            for market in markets
+            if not any(
+                (market.get("ticker") or "").startswith(prefix)
+                for prefix in blacklist_prefixes
+            )
+            and not any(
+                substring in (market.get("ticker") or "")
+                for substring in blacklist_substrings
+            )
+        ]
         activity_key = None
         for key in ("volume_24h", "volume", "open_interest"):
-            if any(key in market for market in markets):
+            active_markets = [
+                market
+                for market in markets
+                if (market.get(key) or 0) > 0
+            ]
+            if active_markets:
                 activity_key = key
-                active_markets = [
-                    market for market in markets if (market.get(key) or 0) > 0
-                ]
-                if active_markets:
-                    markets = sorted(
-                        active_markets,
-                        key=lambda market: market.get(key) or 0,
-                        reverse=True,
-                    )
+                markets = sorted(
+                    active_markets,
+                    key=lambda market: market.get(key) or 0,
+                    reverse=True,
+                )
                 break
+        print(f"after_filter_markets={len(markets)}")
         tickers = [market.get("ticker") for market in markets if market.get("ticker")]
         print(
             "demo_count="
