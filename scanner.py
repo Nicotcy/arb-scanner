@@ -53,9 +53,11 @@ def main() -> int:
             if printed >= 50:
                 break
             ticker = market.get("ticker")
+            if not ticker or ticker.startswith("KXMVE") or "MULTIGAMEEXTENDED" in ticker:
+                continue
             yes_ask = market.get("yes_ask")
             no_ask = market.get("no_ask")
-            if not ticker or not yes_ask or not no_ask:
+            if not yes_ask or not no_ask:
                 continue
             yes_ask_prob = yes_ask / 100.0
             no_ask_prob = no_ask / 100.0
