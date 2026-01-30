@@ -38,6 +38,7 @@ class KalshiProvider(MarketDataProvider):
                 for substring in blacklist_substrings
             )
         ]
+
         min_after_blacklist = int(os.getenv("KALSHI_MIN_AFTER_BLACKLIST", "50"))
         if len(markets_filtered) < min_after_blacklist:
             print(
@@ -47,14 +48,12 @@ class KalshiProvider(MarketDataProvider):
             markets = markets_raw
         else:
             markets = markets_filtered
+
         min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
+
         for key in ("volume_24h", "volume", "open_interest"):
-            active_markets = [
-                market
-                for market in markets
-                if (market.get(key) or 0) > 0
-            ]
+            active_markets = [market for market in markets if (market.get(key) or 0) > 0]
             if len(active_markets) >= min_active:
                 markets = sorted(
                     active_markets,
@@ -62,22 +61,7 @@ class KalshiProvider(MarketDataProvider):
                     reverse=True,
                 )
                 break
-        tickers_to_fetch: list[str] = []
-        seen_tickers: set[str] = set()
-        for market in markets:
-            ticker = market.get("ticker")
-            if ticker:
-                if ticker not in seen_tickers:
-                    tickers_to_fetch.append(ticker)
-                    seen_tickers.add(ticker)
-                continue
-            legs = market.get("mve_selected_legs") or []
-            for leg in legs:
-                leg_ticker = leg.get("market_ticker")
-                if not leg_ticker or leg_ticker in seen_tickers:
-                    continue
-                tickers_to_fetch.append(leg_ticker)
-                seen_tickers.add(leg_ticker)
+
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
@@ -95,13 +79,17 @@ class KalshiProvider(MarketDataProvider):
             except Exception:
                 fetch_errors += 1
                 continue
+
             fetched_ok += 1
-            has_any_bid = top.yes_bid is not None or top.no_bid is not None
+
             has_yes_ask = top.yes_ask is not None
             has_no_ask = top.no_ask is not None
+
+            # Conservative: if there are no asks on either side, we can't price safely.
             if not has_yes_ask and not has_no_ask:
                 no_asks_both_sides += 1
                 continue
+
             if has_yes_ask and has_no_ask:
                 two_sided += 1
             else:
@@ -116,7 +104,7 @@ class KalshiProvider(MarketDataProvider):
                 market=Market(
                     venue=self.name(),
                     market_id=ticker,
-                    question=ticker,
+                    question=market.get("title") or ticker,
                     outcomes=("Yes", "No"),
                 ),
                 orderbook=OrderBookTop(
@@ -127,12 +115,10 @@ class KalshiProvider(MarketDataProvider):
                 ),
             )
             yield snapshot
+
         print(
-            "KalshiProvider stats: "
-            f"total={total_tickers} "
-            f"ok={fetched_ok} "
-            f"errors={fetch_errors} "
+            f"KalshiProvider stats: total={total_tickers} "
+            f"ok={fetched_ok} errors={fetch_errors} "
             f"noasks={no_asks_both_sides} "
-            f"one_sided={one_sided_only} "
-            f"two_sided={two_sided}"
+            f"one_sided={one_sided_only} two_sided={two_sided}"
         )
