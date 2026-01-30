@@ -65,9 +65,11 @@ class KalshiProvider(MarketDataProvider):
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
-        no_bids_both_sides = 0
+        no_asks_both_sides = 0
         one_sided_only = 0
         two_sided = 0
+        require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
+        min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
         for market in markets:
             if total_tickers >= max_tickers:
                 break
@@ -84,17 +86,19 @@ class KalshiProvider(MarketDataProvider):
             has_any_bid = top.yes_bid is not None or top.no_bid is not None
             has_yes_ask = top.yes_ask is not None
             has_no_ask = top.no_ask is not None
-            if not has_any_bid:
-                no_bids_both_sides += 1
+            if not has_yes_ask and not has_no_ask:
+                no_asks_both_sides += 1
                 continue
             if has_yes_ask and has_no_ask:
                 two_sided += 1
             else:
                 one_sided_only += 1
-            if not (has_yes_ask or has_no_ask):
+            if require_two_sided and not (has_yes_ask and has_no_ask):
                 continue
-            yes_size = float(top.no_bid_qty or 0)
-            no_size = float(top.yes_bid_qty or 0)
+            yes_size = float(top.yes_ask_qty or 0)
+            no_size = float(top.no_ask_qty or 0)
+            if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
+                continue
             snapshot = MarketSnapshot(
                 market=Market(
                     venue=self.name(),
@@ -115,6 +119,7 @@ class KalshiProvider(MarketDataProvider):
             f"total={total_tickers} "
             f"ok={fetched_ok} "
             f"errors={fetch_errors} "
+            f"noasks={no_asks_both_sides} "
             f"nobids={no_bids_both_sides} "
             f"one_sided={one_sided_only} "
             f"two_sided={two_sided}"

@@ -22,6 +22,8 @@ class KalshiTopOfBook:
     no_ask: float | None
     yes_bid_qty: int | None
     no_bid_qty: int | None
+    yes_ask_qty: int | None
+    no_ask_qty: int | None
 
 
 class KalshiPublicClient:
@@ -116,14 +118,15 @@ class KalshiPublicClient:
                         )
         orderbook = payload.get("orderbook") or payload
 
-        yes_bid, yes_qty = _extract_best_bid(orderbook.get("yes"))
-        no_bid, no_qty = _extract_best_bid(orderbook.get("no"))
+        yes_bid, yes_bid_qty = _extract_best_bid(orderbook.get("yes"))
+        no_bid, no_bid_qty = _extract_best_bid(orderbook.get("no"))
+        yes_ask, yes_ask_qty = _extract_best_ask(orderbook.get("yes"))
+        no_ask, no_ask_qty = _extract_best_ask(orderbook.get("no"))
 
         yes_bid = _cents_to_dollars(yes_bid)
         no_bid = _cents_to_dollars(no_bid)
-
-        yes_ask = None if no_bid is None else 1.0 - no_bid
-        no_ask = None if yes_bid is None else 1.0 - yes_bid
+        yes_ask = _cents_to_dollars(yes_ask)
+        no_ask = _cents_to_dollars(no_ask)
 
         return KalshiTopOfBook(
             ticker=ticker,
@@ -131,8 +134,10 @@ class KalshiPublicClient:
             yes_ask=yes_ask,
             no_bid=no_bid,
             no_ask=no_ask,
-            yes_bid_qty=yes_qty,
-            no_bid_qty=no_qty,
+            yes_bid_qty=yes_bid_qty,
+            no_bid_qty=no_bid_qty,
+            yes_ask_qty=yes_ask_qty,
+            no_ask_qty=no_ask_qty,
         )
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -173,6 +178,43 @@ def _extract_best_bid(side: Any) -> tuple[int | None, int | None]:
         if price is None:
             continue
         if best_price is None or price > best_price:
+            best_price = price
+            best_qty = qty
+
+    return best_price, best_qty
+
+
+def _extract_best_ask(side: Any) -> tuple[int | None, int | None]:
+    if side is None:
+        return None, None
+
+    asks = None
+    if isinstance(side, dict):
+        asks = side.get("asks") or side.get("offers") or side.get("orders")
+    else:
+        asks = side
+
+    if not asks:
+        return None, None
+
+    best_price: int | None = None
+    best_qty: int | None = None
+
+    for ask in asks:
+        price = None
+        qty = None
+        if isinstance(ask, dict):
+            price = ask.get("price") or ask.get("p")
+            qty = ask.get("quantity") or ask.get("size") or ask.get("qty")
+        elif isinstance(ask, (list, tuple)) and len(ask) >= 2:
+            price, qty = ask[0], ask[1]
+
+        price = _coerce_int(price)
+        qty = _coerce_int(qty)
+
+        if price is None:
+            continue
+        if best_price is None or price < best_price:
             best_price = price
             best_qty = qty
 

@@ -47,8 +47,8 @@ def main() -> int:
         for snapshot in snapshots[:limit]:
             yes_ask = snapshot.orderbook.best_yes_price
             no_ask = snapshot.orderbook.best_no_price
-            yes_bid = None if no_ask is None else 1.0 - no_ask
-            no_bid = None if yes_ask is None else 1.0 - yes_ask
+            yes_bid = None
+            no_bid = None
             qty_yes = snapshot.orderbook.best_yes_size
             qty_no = snapshot.orderbook.best_no_size
             liquidity = (
