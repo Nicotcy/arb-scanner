@@ -47,9 +47,12 @@ def main() -> int:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
         client = KalshiPublicClient()
-        markets = list(client.list_open_markets(max_pages=1))
+        max_pages = int(os.getenv("KALSHI_PAGES", "10"))
+        limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
         printed = 0
-        for market in markets:
+        for market in client.list_open_markets(
+            max_pages=max_pages, limit_per_page=limit_per_page
+        ):
             if printed >= 50:
                 break
             ticker = market.get("ticker")
@@ -57,7 +60,7 @@ def main() -> int:
                 continue
             yes_ask = market.get("yes_ask")
             no_ask = market.get("no_ask")
-            if not yes_ask or not no_ask:
+            if yes_ask is None or no_ask is None:
                 continue
             yes_ask_prob = yes_ask / 100.0
             no_ask_prob = no_ask / 100.0
