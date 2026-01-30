@@ -25,6 +25,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use Kalshi public data and run the scanner pipeline.",
     )
+    parser.add_argument(
+        "--kalshi-market-prices",
+        action="store_true",
+        help="Print Kalshi market ask prices from list_open_markets.",
+    )
     return parser.parse_args()
 
 
@@ -38,6 +43,29 @@ def main() -> int:
     if args.use_stub:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
+    elif args.kalshi_market_prices:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        client = KalshiPublicClient()
+        markets = list(client.list_open_markets(max_pages=1))
+        printed = 0
+        for market in markets:
+            if printed >= 50:
+                break
+            ticker = market.get("ticker")
+            yes_ask = market.get("yes_ask")
+            no_ask = market.get("no_ask")
+            if not ticker or not yes_ask or not no_ask:
+                continue
+            yes_ask_prob = yes_ask / 100.0
+            no_ask_prob = no_ask / 100.0
+            spread_sum = yes_ask_prob + no_ask_prob
+            print(f"{ticker}")
+            print(f"  yes_ask={yes_ask_prob}")
+            print(f"  no_ask={no_ask_prob}")
+            print(f"  spread_sum={spread_sum}")
+            printed += 1
+        return 0
     elif args.use_kalshi:
         provider = KalshiProvider()
         limit = int(os.getenv("KALSHI_SNAPSHOT_N", "20"))

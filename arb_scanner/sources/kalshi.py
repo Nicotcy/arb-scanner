@@ -16,22 +16,16 @@ class KalshiProvider(MarketDataProvider):
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         client = KalshiPublicClient()
-
         max_pages = int(os.getenv("KALSHI_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
-
         markets = list(
             client.list_open_markets(
-                max_pages=max_pages,
-                limit_per_page=limit_per_page,
+                max_pages=max_pages, limit_per_page=limit_per_page
             )
         )
-
         markets_raw = markets
-
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
-
         markets_filtered = [
             market
             for market in markets
