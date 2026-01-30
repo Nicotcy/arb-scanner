@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import time
 from typing import Any, Iterable
 
@@ -40,10 +41,14 @@ class KalshiPublicClient:
         self.sleep_s = sleep_s
         self.session = session or requests.Session()
 
-    def list_open_markets(self, max_pages: int = 1) -> Iterable[dict[str, Any]]:
+    def list_open_markets(
+        self, max_pages: int = 1, limit_per_page: int | None = None
+    ) -> Iterable[dict[str, Any]]:
         """List open markets using small pagination."""
 
-        params: dict[str, Any] = {"status": "open", "limit": self.page_limit}
+        if limit_per_page is None:
+            limit_per_page = self.page_limit
+        params: dict[str, Any] = {"status": "open", "limit": limit_per_page}
         pages = 0
         cursor: str | None = None
 
@@ -70,6 +75,45 @@ class KalshiPublicClient:
         """Return top-of-book prices/quantities for a market ticker."""
 
         payload = self.get_orderbook(ticker)
+        if os.getenv("KALSHI_DEBUG_ORDERBOOK") == "1":
+            print(f"orderbook debug ticker={ticker}")
+            print(f"orderbook top-level keys={list(payload.keys())}")
+            orderbook = payload.get("orderbook")
+            if isinstance(orderbook, dict):
+                print(f"orderbook keys={list(orderbook.keys())}")
+            else:
+                print("orderbook missing or not a dict")
+            if isinstance(orderbook, dict):
+                for side_key in ("yes", "no"):
+                    side_value = orderbook.get(side_key)
+                    if side_value is None:
+                        print(
+                            f"orderbook {side_key} missing, keys={list(orderbook.keys())}"
+                        )
+                        continue
+                    if isinstance(side_value, dict):
+                        print(
+                            f"orderbook {side_key} keys={list(side_value.keys())}"
+                        )
+                        for nested_key, nested_value in side_value.items():
+                            if isinstance(nested_value, dict):
+                                print(
+                                    f"orderbook {side_key}.{nested_key} keys="
+                                    f"{list(nested_value.keys())}"
+                                )
+                            elif isinstance(nested_value, list):
+                                print(
+                                    f"orderbook {side_key}.{nested_key} list_len="
+                                    f"{len(nested_value)}"
+                                )
+                    elif isinstance(side_value, list):
+                        print(
+                            f"orderbook {side_key} list_len={len(side_value)}"
+                        )
+                    else:
+                        print(
+                            f"orderbook {side_key} type={type(side_value).__name__}"
+                        )
         orderbook = payload.get("orderbook") or payload
 
         yes_bid, yes_qty = _extract_best_bid(orderbook.get("yes"))
