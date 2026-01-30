@@ -16,16 +16,22 @@ class KalshiProvider(MarketDataProvider):
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         client = KalshiPublicClient()
+
         max_pages = int(os.getenv("KALSHI_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
+
         markets = list(
             client.list_open_markets(
-                max_pages=max_pages, limit_per_page=limit_per_page
+                max_pages=max_pages,
+                limit_per_page=limit_per_page,
             )
         )
+
         markets_raw = markets
+
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
+
         markets_filtered = [
             market
             for market in markets
@@ -53,7 +59,9 @@ class KalshiProvider(MarketDataProvider):
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
 
         for key in ("volume_24h", "volume", "open_interest"):
-            active_markets = [market for market in markets if (market.get(key) or 0) > 0]
+            active_markets = [
+                market for market in markets if (market.get(key) or 0) > 0
+            ]
             if len(active_markets) >= min_active:
                 markets = sorted(
                     active_markets,
@@ -62,18 +70,44 @@ class KalshiProvider(MarketDataProvider):
                 )
                 break
 
+        # ------------------------------------------------------------
+        # Build list of real tradable tickers (expand MVE containers)
+        # ------------------------------------------------------------
+        tickers_to_fetch: list[str] = []
+        seen_tickers: set[str] = set()
+
+        for market in markets:
+            ticker = market.get("ticker")
+            if ticker:
+                if ticker not in seen_tickers:
+                    tickers_to_fetch.append(ticker)
+                    seen_tickers.add(ticker)
+                continue
+
+            legs = market.get("mve_selected_legs") or []
+            for leg in legs:
+                leg_ticker = leg.get("market_ticker")
+                if not leg_ticker or leg_ticker in seen_tickers:
+                    continue
+                tickers_to_fetch.append(leg_ticker)
+                seen_tickers.add(leg_ticker)
+
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
         no_asks_both_sides = 0
         one_sided_only = 0
         two_sided = 0
+
         require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
         min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
+
         for ticker in tickers_to_fetch:
             if total_tickers >= max_tickers:
                 break
+
             total_tickers += 1
+
             try:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
@@ -85,7 +119,6 @@ class KalshiProvider(MarketDataProvider):
             has_yes_ask = top.yes_ask is not None
             has_no_ask = top.no_ask is not None
 
-            # Conservative: if there are no asks on either side, we can't price safely.
             if not has_yes_ask and not has_no_ask:
                 no_asks_both_sides += 1
                 continue
@@ -94,17 +127,21 @@ class KalshiProvider(MarketDataProvider):
                 two_sided += 1
             else:
                 one_sided_only += 1
+
             if require_two_sided and not (has_yes_ask and has_no_ask):
                 continue
+
             yes_size = float(top.yes_ask_qty or 0)
             no_size = float(top.no_ask_qty or 0)
+
             if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
                 continue
+
             snapshot = MarketSnapshot(
                 market=Market(
                     venue=self.name(),
                     market_id=ticker,
-                    question=market.get("title") or ticker,
+                    question=ticker,
                     outcomes=("Yes", "No"),
                 ),
                 orderbook=OrderBookTop(
@@ -114,6 +151,7 @@ class KalshiProvider(MarketDataProvider):
                     best_no_size=no_size,
                 ),
             )
+
             yield snapshot
 
         print(
