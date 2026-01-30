@@ -1,51 +1,111 @@
-"""Scanner logic for candidate cross-market arbitrage."""
-
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Iterable
+import argparse
 
-from arb_scanner.config import ScannerConfig
-from arb_scanner.models import MarketSnapshot, Opportunity, format_opportunity, iter_pairs
+from arb_scanner.scanner import run_scan
+from arb_scanner.sources.stub import StubProvider
 
 
-def compute_opportunities(
-    markets_a: Iterable[MarketSnapshot],
-    markets_b: Iterable[MarketSnapshot],
-    config: ScannerConfig,
-) -> list[Opportunity]:
-    opportunities: list[Opportunity] = []
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Arbitrage scanner (dry-run)")
+    parser.add_argument("--use-stub", action="store_true", help="Run using stub data")
+    parser.add_argument(
+        "--use-kalshi",
+        action="store_true",
+        help="Fetch Kalshi snapshots (read-only) and print count",
+    )
+    parser.add_argument(
+        "--kalshi-market-prices",
+        action="store_true",
+        help="Print Kalshi market ask prices from list_open_markets (expands MVE legs).",
+    )
+    return parser.parse_args()
 
-    for snap_a, snap_b in iter_pairs(markets_a, markets_b):
-        yes_price = snap_a.orderbook.best_yes_price
-        no_price = snap_b.orderbook.best_no_price
-        hedge_cost = yes_price + no_price
-        estimated_fees = hedge_cost * (config.fee_buffer_bps / 10_000)
-        top_liquidity = min(snap_a.orderbook.best_yes_size, snap_b.orderbook.best_no_size)
-        market_mismatch = not (snap_a.market.is_binary and snap_b.market.is_binary)
-        net_edge = 1.0 - (hedge_cost + estimated_fees)
 
-        opportunities.append(
-            Opportunity(
-                market_pair=f"{snap_a.market.venue}:{snap_a.market.market_id} vs {snap_b.market.venue}:{snap_b.market.market_id}",
-                best_yes_price_A=yes_price,
-                best_no_price_B=no_price,
-                hedge_cost=hedge_cost,
-                estimated_fees=estimated_fees,
-                top_of_book_liquidity=top_liquidity,
-                market_mismatch=market_mismatch,
-                net_edge=net_edge,
-            )
+def main() -> int:
+    args = parse_args()
+
+    # El scanner está diseñado como dry-run por defecto
+    # (si en tu repo existe config/DRY_RUN esto se valida dentro de run_scan)
+    if args.use_stub:
+        provider_a = StubProvider("Kalshi")
+        provider_b = StubProvider("Polymarket")
+        run_scan(provider_a, provider_b)
+        return 0
+
+    if args.kalshi_market_prices:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        def is_mve(t: str) -> bool:
+            return t.startswith("KXMVE") or ("MULTIGAMEEXTENDED" in t)
+
+        client = KalshiPublicClient()
+
+        # Ojo: en tu caso casi todo es MVE, así que si no expandes legs, no sale nada útil.
+        max_pages = 1
+        limit_per_page = 200
+
+        markets = list(
+            client.list_open_markets(max_pages=max_pages, limit_per_page=limit_per_page)
         )
 
-    return opportunities
+        tickers_to_price: list[str] = []
+        seen: set[str] = set()
+
+        for m in markets:
+            t = (m.get("ticker") or "").strip()
+            if not t:
+                continue
+
+            if is_mve(t):
+                legs = m.get("mve_selected_legs") or []
+                for leg in legs:
+                    leg_ticker = (leg.get("market_ticker") or "").strip()
+                    if not leg_ticker or leg_ticker in seen:
+                        continue
+                    tickers_to_price.append(leg_ticker)
+                    seen.add(leg_ticker)
+                continue
+
+            if t not in seen:
+                tickers_to_price.append(t)
+                seen.add(t)
+
+        printed = 0
+        for ticker in tickers_to_price:
+            if printed >= 50:
+                break
+            try:
+                top = client.fetch_top_of_book(ticker)
+            except Exception:
+                continue
+
+            if top.yes_ask is None or top.no_ask is None:
+                continue
+
+            yes_ask_prob = top.yes_ask / 100.0
+            no_ask_prob = top.no_ask / 100.0
+            spread_sum = yes_ask_prob + no_ask_prob
+
+            print(f"{ticker}")
+            print(f"  yes_ask={yes_ask_prob}")
+            print(f"  no_ask={no_ask_prob}")
+            print(f"  spread_sum={spread_sum}")
+            printed += 1
+
+        return 0
+
+    if args.use_kalshi:
+        from arb_scanner.sources.kalshi import KalshiProvider
+
+        provider = KalshiProvider()
+        snapshots = list(provider.fetch_market_snapshots())
+        print(f"snapshots={len(snapshots)}")
+        return 0
+
+    # Default: nada
+    return 0
 
 
-def format_opportunity_table(opportunities: Iterable[Opportunity]) -> str:
-    lines = [format_opportunity(opportunity) for opportunity in opportunities]
-    return "\n".join(lines)
-
-
-def summarize_config(config: ScannerConfig) -> str:
-    values = asdict(config)
-    return ", ".join(f"{key}={value}" for key, value in values.items())
+if __name__ == "__main__":
+    raise SystemExit(main())
