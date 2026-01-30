@@ -70,9 +70,9 @@ class KalshiProvider(MarketDataProvider):
                 )
                 break
 
-        # ------------------------------------------------------------
-        # Build list of real tradable tickers (expand MVE containers)
-        # ------------------------------------------------------------
+        # ============================================================
+        # BUILD LIST OF REAL TRADEABLE TICKERS (OUTSIDE ALL LOOPS)
+        # ============================================================
         tickers_to_fetch: list[str] = []
         seen_tickers: set[str] = set()
 
@@ -92,6 +92,9 @@ class KalshiProvider(MarketDataProvider):
                 tickers_to_fetch.append(leg_ticker)
                 seen_tickers.add(leg_ticker)
 
+        # ============================================================
+        # SNAPSHOT FETCH LOOP
+        # ============================================================
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
@@ -137,7 +140,7 @@ class KalshiProvider(MarketDataProvider):
             if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
                 continue
 
-            snapshot = MarketSnapshot(
+            yield MarketSnapshot(
                 market=Market(
                     venue=self.name(),
                     market_id=ticker,
@@ -151,8 +154,6 @@ class KalshiProvider(MarketDataProvider):
                     best_no_size=no_size,
                 ),
             )
-
-            yield snapshot
 
         print(
             f"KalshiProvider stats: total={total_tickers} "
