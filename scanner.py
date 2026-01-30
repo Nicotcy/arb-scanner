@@ -9,6 +9,7 @@ import sys
 
 from arb_scanner.config import load_config
 from arb_scanner.scanner import compute_opportunities, format_opportunity_table, summarize_config
+from arb_scanner.sources.kalshi import KalshiProvider
 from arb_scanner.sources.stub import StubProvider
 
 
@@ -18,6 +19,11 @@ def parse_args() -> argparse.Namespace:
         "--use-stub",
         action="store_true",
         help="Use stub data instead of live APIs (default in this repo).",
+    )
+    parser.add_argument(
+        "--use-kalshi",
+        action="store_true",
+        help="Use Kalshi public data and run the scanner pipeline.",
     )
     return parser.parse_args()
 
@@ -32,6 +38,9 @@ def main() -> int:
     if args.use_stub:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
+    elif args.use_kalshi:
+        provider_a = KalshiProvider()
+        provider_b = KalshiProvider()
     else:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
