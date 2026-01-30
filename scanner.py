@@ -51,10 +51,15 @@ def main() -> int:
             no_bid = None if yes_ask is None else 1.0 - yes_ask
             qty_yes = snapshot.orderbook.best_yes_size
             qty_no = snapshot.orderbook.best_no_size
-            liquidity = min(qty_yes, qty_no)
+            liquidity = (
+                min(qty_yes or 0, qty_no or 0)
+                if qty_yes and qty_no
+                else (qty_yes or qty_no or 0)
+            )
             spread_sum = (yes_ask or 0) + (no_ask or 0)
+            ticker = snapshot.market.market_id
             print(
-                f"{snapshot.market.market_id} | "
+                f"{ticker} | "
                 f"yes_ask={yes_ask} no_ask={no_ask} "
                 f"yes_bid={yes_bid} no_bid={no_bid} "
                 f"qtyY={qty_yes} qtyN={qty_no} "
