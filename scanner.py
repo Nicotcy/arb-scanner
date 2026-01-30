@@ -39,6 +39,10 @@ def main() -> int:
         demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
         max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "200"))
         client = KalshiPublicClient()
+        debug_ticker = os.getenv("KALSHI_DEBUG_ONE_TICKER")
+        if debug_ticker:
+            client.fetch_top_of_book(debug_ticker)
+            sys.exit(0)
         max_pages = int(os.getenv("KALSHI_DEMO_MAX_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_DEMO_LIMIT", "200"))
         markets = list(
@@ -85,7 +89,6 @@ def main() -> int:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
                 continue
-            top = client.fetch_top_of_book(ticker)
             if (
                 (top.yes_bid is None and top.no_bid is None)
                 or (top.yes_ask is None and top.no_ask is None)
