@@ -40,10 +40,14 @@ class KalshiPublicClient:
         self.sleep_s = sleep_s
         self.session = session or requests.Session()
 
-    def list_open_markets(self, max_pages: int = 1) -> Iterable[dict[str, Any]]:
+    def list_open_markets(
+        self, max_pages: int = 1, limit_per_page: int | None = None
+    ) -> Iterable[dict[str, Any]]:
         """List open markets using small pagination."""
 
-        params: dict[str, Any] = {"status": "open", "limit": self.page_limit}
+        if limit_per_page is None:
+            limit_per_page = self.page_limit
+        params: dict[str, Any] = {"status": "open", "limit": limit_per_page}
         pages = 0
         cursor: str | None = None
 

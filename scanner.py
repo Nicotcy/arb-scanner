@@ -39,7 +39,13 @@ def main() -> int:
         demo_count = int(os.getenv("KALSHI_DEMO_N", "10"))
         max_scan = int(os.getenv("KALSHI_DEMO_MAX_SCAN", "200"))
         client = KalshiPublicClient()
-        markets = list(client.list_open_markets(max_pages=1))
+        max_pages = int(os.getenv("KALSHI_DEMO_MAX_PAGES", "5"))
+        limit_per_page = int(os.getenv("KALSHI_DEMO_LIMIT", "200"))
+        markets = list(
+            client.list_open_markets(
+                max_pages=max_pages, limit_per_page=limit_per_page
+            )
+        )
         activity_key = None
         for key in ("volume_24h", "volume", "open_interest"):
             if any(key in market for market in markets):
@@ -55,6 +61,18 @@ def main() -> int:
                     )
                 break
         tickers = [market.get("ticker") for market in markets if market.get("ticker")]
+        print(
+            "demo_count="
+            f"{demo_count} "
+            "max_scan="
+            f"{max_scan} "
+            "pages="
+            f"{max_pages} "
+            "limit="
+            f"{limit_per_page} "
+            "tickers="
+            f"{len(tickers)}"
+        )
         printed = 0
         scanned = 0
         for ticker in tickers:
