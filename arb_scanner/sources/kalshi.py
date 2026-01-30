@@ -46,6 +46,7 @@ class KalshiProvider(MarketDataProvider):
                 if (market.get(key) or 0) > 0
             ]
             if len(active_markets) >= min_active:
+            if active_markets:
                 markets = sorted(
                     active_markets,
                     key=lambda market: market.get(key) or 0,
