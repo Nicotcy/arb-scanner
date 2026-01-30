@@ -18,16 +18,14 @@ class KalshiProvider(MarketDataProvider):
         client = KalshiPublicClient()
         max_pages = int(os.getenv("KALSHI_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
-
         markets = list(
-            client.list_open_markets(max_pages=max_pages, limit_per_page=limit_per_page)
+            client.list_open_markets(
+                max_pages=max_pages, limit_per_page=limit_per_page
+            )
         )
-
         markets_raw = markets
-
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
-
         markets_filtered = [
             market
             for market in markets
@@ -70,20 +68,12 @@ class KalshiProvider(MarketDataProvider):
         no_asks_both_sides = 0
         one_sided_only = 0
         two_sided = 0
-
         require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
         min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
-
-        for market in markets:
+        for ticker in tickers_to_fetch:
             if total_tickers >= max_tickers:
                 break
-
-            ticker = market.get("ticker")
-            if not ticker:
-                continue
-
             total_tickers += 1
-
             try:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
@@ -104,18 +94,12 @@ class KalshiProvider(MarketDataProvider):
                 two_sided += 1
             else:
                 one_sided_only += 1
-
-            # Conservative: require both asks to be present if configured.
             if require_two_sided and not (has_yes_ask and has_no_ask):
                 continue
-
             yes_size = float(top.yes_ask_qty or 0)
             no_size = float(top.no_ask_qty or 0)
-
-            # Conservative: if both asks exist, enforce minimum top-of-book liquidity.
             if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
                 continue
-
             snapshot = MarketSnapshot(
                 market=Market(
                     venue=self.name(),
