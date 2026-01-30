@@ -40,9 +40,9 @@ def main() -> int:
         provider_b = StubProvider("Polymarket")
     elif args.use_kalshi:
         provider = KalshiProvider()
-        snapshots = list(provider.fetch_market_snapshots())
         limit = int(os.getenv("KALSHI_SNAPSHOT_N", "20"))
         print("KALSHI SNAPSHOTS (read-only)")
+        snapshots = list(provider.fetch_market_snapshots())
         print(f"snapshots={len(snapshots)}")
         for snapshot in snapshots[:limit]:
             yes_ask = snapshot.orderbook.best_yes_price

@@ -37,12 +37,15 @@ class KalshiProvider(MarketDataProvider):
                 for substring in blacklist_substrings
             )
         ]
+        min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
+        max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
         for key in ("volume_24h", "volume", "open_interest"):
             active_markets = [
                 market
                 for market in markets
                 if (market.get(key) or 0) > 0
             ]
+            if len(active_markets) >= min_active:
             if active_markets:
                 markets = sorted(
                     active_markets,
@@ -57,6 +60,8 @@ class KalshiProvider(MarketDataProvider):
         one_sided_only = 0
         two_sided = 0
         for market in markets:
+            if total_tickers >= max_tickers:
+                break
             ticker = market.get("ticker")
             if not ticker:
                 continue
