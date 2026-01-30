@@ -47,23 +47,34 @@ def main() -> int:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
         client = KalshiPublicClient()
-        max_pages = int(os.getenv("KALSHI_PAGES", "10"))
+        max_pages = int(os.getenv("KALSHI_PAGES", "3"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
-        printed = 0
+        tickers_to_price: list[str] = []
+        seen: set[str] = set()
         for market in client.list_open_markets(
             max_pages=max_pages, limit_per_page=limit_per_page
         ):
+            ticker = market.get("ticker") or ""
+            if ticker.startswith("KXMVE") or "MULTIGAMEEXTENDED" in ticker:
+                legs = market.get("mve_selected_legs") or []
+                for leg in legs:
+                    leg_ticker = leg.get("market_ticker")
+                    if leg_ticker and leg_ticker not in seen:
+                        tickers_to_price.append(leg_ticker)
+                        seen.add(leg_ticker)
+                continue
+            if ticker and ticker not in seen:
+                tickers_to_price.append(ticker)
+                seen.add(ticker)
+        printed = 0
+        for ticker in tickers_to_price:
             if printed >= 50:
                 break
-            ticker = market.get("ticker")
-            if not ticker or ticker.startswith("KXMVE") or "MULTIGAMEEXTENDED" in ticker:
+            top = client.fetch_top_of_book(ticker)
+            if top.yes_ask is None or top.no_ask is None:
                 continue
-            yes_ask = market.get("yes_ask")
-            no_ask = market.get("no_ask")
-            if yes_ask is None or no_ask is None:
-                continue
-            yes_ask_prob = yes_ask / 100.0
-            no_ask_prob = no_ask / 100.0
+            yes_ask_prob = top.yes_ask / 100.0
+            no_ask_prob = top.no_ask / 100.0
             spread_sum = yes_ask_prob + no_ask_prob
             print(f"{ticker}")
             print(f"  yes_ask={yes_ask_prob}")
