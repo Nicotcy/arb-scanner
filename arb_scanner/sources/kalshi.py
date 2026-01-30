@@ -38,6 +38,7 @@ class KalshiProvider(MarketDataProvider):
                 for substring in blacklist_substrings
             )
         ]
+
         min_after_blacklist = int(os.getenv("KALSHI_MIN_AFTER_BLACKLIST", "50"))
         if len(markets_filtered) < min_after_blacklist:
             print(
@@ -47,13 +48,13 @@ class KalshiProvider(MarketDataProvider):
             markets = markets_raw
         else:
             markets = markets_filtered
+
         min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
+
         for key in ("volume_24h", "volume", "open_interest"):
             active_markets = [
-                market
-                for market in markets
-                if (market.get(key) or 0) > 0
+                market for market in markets if (market.get(key) or 0) > 0
             ]
             if len(active_markets) >= min_active:
                 markets = sorted(
@@ -62,8 +63,13 @@ class KalshiProvider(MarketDataProvider):
                     reverse=True,
                 )
                 break
+
+        # ============================================================
+        # BUILD LIST OF REAL TRADEABLE TICKERS (OUTSIDE ALL LOOPS)
+        # ============================================================
         tickers_to_fetch: list[str] = []
         seen_tickers: set[str] = set()
+
         for market in markets:
             ticker = market.get("ticker")
             if ticker:
@@ -71,6 +77,7 @@ class KalshiProvider(MarketDataProvider):
                     tickers_to_fetch.append(ticker)
                     seen_tickers.add(ticker)
                 continue
+
             legs = market.get("mve_selected_legs") or []
             for leg in legs:
                 leg_ticker = leg.get("market_ticker")
@@ -78,41 +85,56 @@ class KalshiProvider(MarketDataProvider):
                     continue
                 tickers_to_fetch.append(leg_ticker)
                 seen_tickers.add(leg_ticker)
+
+        # ============================================================
+        # SNAPSHOT FETCH LOOP
+        # ============================================================
         total_tickers = 0
         fetched_ok = 0
         fetch_errors = 0
         no_asks_both_sides = 0
         one_sided_only = 0
         two_sided = 0
+
         require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
         min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
+
         for ticker in tickers_to_fetch:
             if total_tickers >= max_tickers:
                 break
+
             total_tickers += 1
+
             try:
                 top = client.fetch_top_of_book(ticker)
             except Exception:
                 fetch_errors += 1
                 continue
+
             fetched_ok += 1
-            has_any_bid = top.yes_bid is not None or top.no_bid is not None
+
             has_yes_ask = top.yes_ask is not None
             has_no_ask = top.no_ask is not None
+
             if not has_yes_ask and not has_no_ask:
                 no_asks_both_sides += 1
                 continue
+
             if has_yes_ask and has_no_ask:
                 two_sided += 1
             else:
                 one_sided_only += 1
+
             if require_two_sided and not (has_yes_ask and has_no_ask):
                 continue
+
             yes_size = float(top.yes_ask_qty or 0)
             no_size = float(top.no_ask_qty or 0)
+
             if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
                 continue
-            snapshot = MarketSnapshot(
+
+            yield MarketSnapshot(
                 market=Market(
                     venue=self.name(),
                     market_id=ticker,
@@ -126,13 +148,10 @@ class KalshiProvider(MarketDataProvider):
                     best_no_size=no_size,
                 ),
             )
-            yield snapshot
+
         print(
-            "KalshiProvider stats: "
-            f"total={total_tickers} "
-            f"ok={fetched_ok} "
-            f"errors={fetch_errors} "
+            f"KalshiProvider stats: total={total_tickers} "
+            f"ok={fetched_ok} errors={fetch_errors} "
             f"noasks={no_asks_both_sides} "
-            f"one_sided={one_sided_only} "
-            f"two_sided={two_sided}"
+            f"one_sided={one_sided_only} two_sided={two_sided}"
         )
