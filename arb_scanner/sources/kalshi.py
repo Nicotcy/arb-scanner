@@ -11,33 +11,38 @@ from arb_scanner.sources.base import MarketDataProvider
 
 
 class KalshiProvider(MarketDataProvider):
+    """MarketDataProvider implementation for Kalshi (public read-only API)."""
+
+    def __init__(self) -> None:
+        self.client = KalshiPublicClient()
+
     def name(self) -> str:
         return "Kalshi"
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
-        client = KalshiPublicClient()
+        # Paging del listado
         max_pages = int(os.getenv("KALSHI_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
+
         markets = list(
-            client.list_open_markets(
-                max_pages=max_pages, limit_per_page=limit_per_page
-            )
+            self.client.list_open_markets(max_pages=max_pages, limit_per_page=limit_per_page)
         )
+
         markets_raw = markets
+
+        # Blacklist para reducir ruido (especialmente MVEs deportivos gigantes)
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
+
         markets_filtered = [
             market
             for market in markets
             if not any(
-                (market.get("ticker") or "").startswith(prefix)
-                for prefix in blacklist_prefixes
+                (market.get("ticker") or "").startswith(prefix) for prefix in blacklist_prefixes
             )
-            and not any(
-                substring in (market.get("ticker") or "")
-                for substring in blacklist_substrings
-            )
+            and not any(sub in (market.get("ticker") or "") for sub in blacklist_substrings)
         ]
+
         min_after_blacklist = int(os.getenv("KALSHI_MIN_AFTER_BLACKLIST", "50"))
         if len(markets_filtered) < min_after_blacklist:
             print(
@@ -122,19 +127,18 @@ class KalshiProvider(MarketDataProvider):
                     outcomes=("Yes", "No"),
                 ),
                 orderbook=OrderBookTop(
-                    best_yes_price=yes_ask,
+                    best_yes_price=top.yes_ask,
                     best_yes_size=yes_size,
-                    best_no_price=no_ask,
+                    best_no_price=top.no_ask,
                     best_no_size=no_size,
                 ),
             )
+            ok += 1
             yield snapshot
+
         print(
             "KalshiProvider stats: "
-            f"total={total_tickers} "
-            f"ok={fetched_ok} "
-            f"errors={fetch_errors} "
-            f"noasks={no_asks_both_sides} "
-            f"one_sided={one_sided_only} "
-            f"two_sided={two_sided}"
+            f"total={total} ok={ok} errors={fetch_errors} "
+            f"noprices={noprices} liqskip={liqskip} "
+            f"one_sided={one_sided} two_sided={two_sided}"
         )

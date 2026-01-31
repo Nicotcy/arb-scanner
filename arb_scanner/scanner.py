@@ -1,20 +1,27 @@
-"""Scanner logic for candidate cross-market arbitrage."""
-
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Iterable
+from typing import Sequence
 
-from arb_scanner.config import ScannerConfig
-from arb_scanner.models import MarketSnapshot, Opportunity, format_opportunity, iter_pairs
+from arb_scanner.models import MarketSnapshot, Opportunity
+
+
+def summarize_config(config: object) -> str:
+    try:
+        if hasattr(config, "__dataclass_fields__"):
+            d = asdict(config)  # type: ignore[arg-type]
+            return "CONFIG " + " ".join(f"{k}={v}" for k, v in d.items())
+    except Exception:
+        pass
+    return f"CONFIG {config!r}"
 
 _NEAR_MISS_ROWS: list[tuple[str, float, float, float, float, float]] = []
 
 
 def compute_opportunities(
-    markets_a: Iterable[MarketSnapshot],
-    markets_b: Iterable[MarketSnapshot],
-    config: ScannerConfig,
+    a_snapshots: Sequence[MarketSnapshot],
+    b_snapshots: Sequence[MarketSnapshot],
+    min_edge: float = 0.0,
 ) -> list[Opportunity]:
     opportunities: list[Opportunity] = []
     _NEAR_MISS_ROWS.clear()
@@ -61,90 +68,31 @@ def compute_opportunities(
                 market_mismatch=market_mismatch,
                 net_edge=net_edge,
             )
-        )
 
-    return opportunities
-
-
-def format_opportunity_table(opportunities: Iterable[Opportunity]) -> str:
-    lines = [format_opportunity(opportunity) for opportunity in opportunities]
-    return "\n".join(lines)
+    opps.sort(key=lambda o: o.edge, reverse=True)
+    return opps
 
 
-def summarize_config(config: ScannerConfig) -> str:
-    values = asdict(config)
-    return ", ".join(f"{key}={value}" for key, value in values.items())
+def format_opportunity_table(opps: Sequence[Opportunity], limit: int = 25) -> str:
+    if not opps:
+        return "No opportunities found."
 
-
-def format_near_miss_table(markets: Iterable[MarketSnapshot]) -> str:
-    rows: list[tuple[str, float, float, float, float, float, float]] = []
-    for snapshot in markets:
-        if not snapshot.market.is_binary:
-            continue
-        yes_ask = snapshot.orderbook.best_yes_price
-        no_ask = snapshot.orderbook.best_no_price
-        if yes_ask is None or no_ask is None:
-            continue
-        yes_qty = snapshot.orderbook.best_yes_size
-        no_qty = snapshot.orderbook.best_no_size
-        sum_price = yes_ask + no_ask
-        edge = 1.0 - sum_price
-        rows.append(
-            (
-                snapshot.market.market_id,
-                yes_ask,
-                yes_qty,
-                no_ask,
-                no_qty,
-                sum_price,
-                edge,
-            )
-        )
-
-    if not rows:
-        return ""
-
-    rows.sort(key=lambda row: row[-1], reverse=True)
-    rows = rows[:20]
-
-    lines = [
-        "market_id yes_ask yes_qty no_ask no_qty sum_price edge",
-    ]
-    for (
-        market_id,
-        yes_ask,
-        yes_qty,
-        no_ask,
-        no_qty,
-        sum_price,
-        edge,
-    ) in rows:
+    lines: list[str] = []
+    lines.append("edge  yes@venue(price)  no@venue(price)  question")
+    lines.append("-" * 90)
+    for o in opps[:limit]:
         lines.append(
-            f"{market_id} "
-            f"{yes_ask:.4f} "
-            f"{yes_qty:.4f} "
-            f"{no_ask:.4f} "
-            f"{no_qty:.4f} "
-            f"{sum_price:.4f} "
-            f"{edge:.4f}"
+            f"{o.edge:>5.3f}  {o.buy_yes_venue}({o.buy_yes_price:.3f})  "
+            f"{o.buy_no_venue}({o.buy_no_price:.3f})  {o.question}"
         )
     return "\n".join(lines)
 
 
-def format_near_miss_pairs_table() -> str:
-    if not _NEAR_MISS_ROWS:
-        return ""
-    rows = sorted(_NEAR_MISS_ROWS, key=lambda row: row[4], reverse=True)[:20]
-    lines = [
-        "market_id yes_ask no_ask sum_price edge executable_size",
-    ]
-    for market_id, yes_ask, no_ask, sum_price, edge, executable_size in rows:
-        lines.append(
-            f"{market_id} "
-            f"{yes_ask:.4f} "
-            f"{no_ask:.4f} "
-            f"{sum_price:.4f} "
-            f"{edge:.4f} "
-            f"{executable_size:.4f}"
-        )
-    return "\n".join(lines)
+def run_scan(
+    provider_a: object,
+    provider_b: object,
+    min_edge: float = 0.0,
+) -> list[Opportunity]:
+    a_snaps = list(getattr(provider_a, "fetch_market_snapshots")())
+    b_snaps = list(getattr(provider_b, "fetch_market_snapshots")())
+    return compute_opportunities(a_snaps, b_snaps, min_edge=min_edge)
