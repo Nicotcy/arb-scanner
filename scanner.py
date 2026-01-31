@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 from arb_scanner.config import load_config
-from arb_scanner.scanner import compute_opportunities, format_opportunity_table, summarize_config
 from arb_scanner.sources.kalshi import KalshiProvider
 from arb_scanner.sources.stub import StubProvider
+
+# Importamos TODO lo que vamos a usar del módulo core
+from arb_scanner.scanner import (
+    compute_opportunities,
+    format_near_miss_pairs_table,
+    format_opportunity_table,
+    summarize_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,8 +97,6 @@ def main() -> int:
         return 0
 
     elif args.use_kalshi:
-        from arb_scanner.sources.kalshi import KalshiProvider
-
         provider = KalshiProvider()
         snapshots_a = list(provider.fetch_market_snapshots())
         snapshots_b = []  # todavía no metemos Polymarket aquí
@@ -100,25 +104,27 @@ def main() -> int:
     else:
         raise SystemExit("Choose one: --use-stub, --use-kalshi, or --kalshi-market-prices")
 
-    # Si solo tenemos Kalshi, no habrá oportunidades cross-venue todavía
-    if not snapshots_b:
-        print(summarize_config(config))
-        print("No opportunities found.")
-        near_miss_pairs = format_near_miss_pairs_table()
-        if near_miss_pairs:
-            print("Near-miss opportunities (top 20):")
-            print(near_miss_pairs)
-        else:
-            print("No valid binary markets for near-miss table.")
-        return 0
+    # Oportunidades (si hay dos venues); si no, lista vacía
+    opportunities = []
+    if snapshots_b:
+        opportunities = compute_opportunities(snapshots_a, snapshots_b, config)
 
-    print(format_opportunity_table(opportunities))
+    # Output base
+    print(summarize_config(config))
+
+    if opportunities:
+        print(format_opportunity_table(opportunities))
+    else:
+        print("No opportunities found.")
+
+    # Near-miss: se puede imprimir aunque solo haya Kalshi (si la función está implementada así)
     near_miss_pairs = format_near_miss_pairs_table()
     if near_miss_pairs:
         print("Near-miss opportunities (top 20):")
         print(near_miss_pairs)
     else:
         print("No valid binary markets for near-miss table.")
+
     return 0
 
 
