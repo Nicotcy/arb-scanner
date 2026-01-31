@@ -236,6 +236,22 @@ def _cents_to_dollars(value: int | None) -> float | None:
     return value / 100
 
 
+def normalize_kalshi_price(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric > 1.0:
+        numeric = numeric / 100.0
+    if numeric < 0.0:
+        return 0.0
+    if numeric > 1.0:
+        return 1.0
+    return numeric
+
+
 def fetch_kalshi_top_of_book(ticker: str, client: KalshiPublicClient | None = None) -> KalshiTopOfBook:
     """Convenience helper to return a top-of-book snapshot."""
 

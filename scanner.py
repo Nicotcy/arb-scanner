@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from arb_scanner.config import load_config
 from arb_scanner.scanner import compute_opportunities, format_opportunity_table, summarize_config
+from arb_scanner.sources.kalshi import KalshiProvider
 from arb_scanner.sources.stub import StubProvider
 
 

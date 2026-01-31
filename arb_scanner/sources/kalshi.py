@@ -1,22 +1,13 @@
+"""Kalshi market data provider (read-only via public API)."""
+
 from __future__ import annotations
 
+from collections.abc import Iterable
 import os
-from typing import Iterable
 
-from arb_scanner.kalshi_public import KalshiPublicClient
+from arb_scanner.kalshi_public import KalshiPublicClient, normalize_kalshi_price
 from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
-
-
-class KalshiProvider:
-    """
-    Read-only Kalshi snapshot provider.
-
-    Nota importante:
-    - El endpoint /markets (list_open_markets) te está devolviendo casi todo como MVE
-      (market tipo "combo" con legs). Esos MVEs no sirven como tickers "subyacentes".
-    - Para un scanner útil, expandimos los MVEs a sus legs (market_ticker) y a esos
-      tickers les pedimos top-of-book (orderbook), que sí trae precios.
-    """
+from arb_scanner.sources.base import MarketDataProvider
 
     def __init__(self) -> None:
         self.client = KalshiPublicClient()
