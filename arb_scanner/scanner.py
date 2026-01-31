@@ -68,6 +68,7 @@ def compute_opportunities(
                 market_mismatch=market_mismatch,
                 net_edge=net_edge,
             )
+        )
 
     opps.sort(key=lambda o: o.edge, reverse=True)
     return opps
