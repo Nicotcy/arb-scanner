@@ -1,99 +1,224 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Sequence
+from typing import Iterable
 
-from arb_scanner.models import MarketSnapshot, Opportunity
+from arb_scanner.config import ScannerConfig
+from arb_scanner.models import MarketSnapshot, Opportunity, iter_pairs
 
 
-def summarize_config(config: object) -> str:
-    try:
-        if hasattr(config, "__dataclass_fields__"):
-            d = asdict(config)  # type: ignore[arg-type]
-            return "CONFIG " + " ".join(f"{k}={v}" for k, v in d.items())
-    except Exception:
-        pass
-    return f"CONFIG {config!r}"
+def summarize_config(config: ScannerConfig) -> str:
+    return (
+        "CONFIG "
+        f"dry_run={config.dry_run} "
+        f"alert_only={config.alert_only} "
+        f"alert_threshold={config.alert_threshold} "
+        f"fee_buffer_bps={config.fee_buffer_bps}"
+    )
 
-_NEAR_MISS_ROWS: list[tuple[str, float, float, float, float, float]] = []
+
+def _normalize_price_to_prob(price: float | None) -> float | None:
+    """
+    Normaliza precio a probabilidad 0..1.
+    Kalshi suele venir en "cents" 0..100. Si viene ya en 0..1, lo deja.
+    """
+    if price is None:
+        return None
+    p = float(price)
+    if p > 1.0:
+        return p / 100.0
+    return p
+
+
+def _fee_buffer(cost: float, config: ScannerConfig) -> float:
+    return cost * (config.fee_buffer_bps / 10_000.0)
+
+
+def _fmt_float(x: float | None, nd: int = 6) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.{nd}f}"
 
 
 def compute_opportunities(
-    a_snapshots: Sequence[MarketSnapshot],
-    b_snapshots: Sequence[MarketSnapshot],
-    min_edge: float = 0.0,
+    snapshots_a: Iterable[MarketSnapshot],
+    snapshots_b: Iterable[MarketSnapshot],
+    config: ScannerConfig,
 ) -> list[Opportunity]:
-    opportunities: list[Opportunity] = []
-    _NEAR_MISS_ROWS.clear()
+    """
+    Cross-venue opportunities.
+    Matching por (normalize_question(question), outcomes) vía iter_pairs() en models.py.
+    """
+    opps: list[Opportunity] = []
 
-    for snap_a, snap_b in iter_pairs(markets_a, markets_b):
-        yes_price = snap_a.orderbook.best_yes_price
-        no_price = snap_b.orderbook.best_no_price
-        if (
-            snap_a.market.is_binary
-            and snap_b.market.is_binary
-            and yes_price is not None
-            and no_price is not None
-        ):
-            sum_price = yes_price + no_price
-            edge = 1.0 - sum_price
-            executable_size = min(
-                snap_a.orderbook.best_yes_size, snap_b.orderbook.best_no_size
-            )
-            _NEAR_MISS_ROWS.append(
-                (
-                    f"{snap_a.market.venue}:{snap_a.market.market_id} vs "
-                    f"{snap_b.market.venue}:{snap_b.market.market_id}",
-                    yes_price,
-                    no_price,
-                    sum_price,
-                    edge,
-                    executable_size,
+    for a, b in iter_pairs(snapshots_a, snapshots_b):
+        # Necesitamos binarios y precios ask de ambos lados
+        if not a.market.is_binary or not b.market.is_binary:
+            continue
+
+        a_yes = _normalize_price_to_prob(a.orderbook.best_yes_price)
+        a_no = _normalize_price_to_prob(a.orderbook.best_no_price)
+        b_yes = _normalize_price_to_prob(b.orderbook.best_yes_price)
+        b_no = _normalize_price_to_prob(b.orderbook.best_no_price)
+
+        # Caso 1: Buy YES en A + Buy NO en B
+        if a_yes is not None and b_no is not None:
+            cost = a_yes + b_no
+            net_edge = 1.0 - cost - _fee_buffer(cost, config)
+            if net_edge > 0:
+                opps.append(
+                    Opportunity(
+                        question=a.market.question,
+                        outcomes=tuple(a.market.outcomes),
+                        buy_yes_venue=a.market.venue,
+                        buy_yes_price=a_yes,
+                        buy_no_venue=b.market.venue,
+                        buy_no_price=b_no,
+                        edge=net_edge,
+                    )
                 )
-            )
-        hedge_cost = yes_price + no_price
-        estimated_fees = hedge_cost * (config.fee_buffer_bps / 10_000)
-        top_liquidity = min(snap_a.orderbook.best_yes_size, snap_b.orderbook.best_no_size)
-        market_mismatch = not (snap_a.market.is_binary and snap_b.market.is_binary)
-        net_edge = 1.0 - (hedge_cost + estimated_fees)
 
-        opportunities.append(
-            Opportunity(
-                market_pair=f"{snap_a.market.venue}:{snap_a.market.market_id} vs {snap_b.market.venue}:{snap_b.market.market_id}",
-                best_yes_price_A=yes_price,
-                best_no_price_B=no_price,
-                hedge_cost=hedge_cost,
-                estimated_fees=estimated_fees,
-                top_of_book_liquidity=top_liquidity,
-                market_mismatch=market_mismatch,
-                net_edge=net_edge,
-            )
-        )
+        # Caso 2: Buy YES en B + Buy NO en A
+        if b_yes is not None and a_no is not None:
+            cost = b_yes + a_no
+            net_edge = 1.0 - cost - _fee_buffer(cost, config)
+            if net_edge > 0:
+                opps.append(
+                    Opportunity(
+                        question=a.market.question,
+                        outcomes=tuple(a.market.outcomes),
+                        buy_yes_venue=b.market.venue,
+                        buy_yes_price=b_yes,
+                        buy_no_venue=a.market.venue,
+                        buy_no_price=a_no,
+                        edge=net_edge,
+                    )
+                )
 
     opps.sort(key=lambda o: o.edge, reverse=True)
     return opps
 
 
-def format_opportunity_table(opps: Sequence[Opportunity], limit: int = 25) -> str:
+def format_opportunity_table(opps: list[Opportunity], limit: int = 20) -> str:
     if not opps:
         return "No opportunities found."
 
-    lines: list[str] = []
-    lines.append("edge  yes@venue(price)  no@venue(price)  question")
-    lines.append("-" * 90)
-    for o in opps[:limit]:
-        lines.append(
-            f"{o.edge:>5.3f}  {o.buy_yes_venue}({o.buy_yes_price:.3f})  "
-            f"{o.buy_no_venue}({o.buy_no_price:.3f})  {o.question}"
-        )
+    rows = opps[:limit]
+    lines = []
+    lines.append(
+        "EDGE      | BUY YES (venue@price)        | BUY NO (venue@price)         | QUESTION"
+    )
+    lines.append("-" * 100)
+    for o in rows:
+        yes_part = f"{o.buy_yes_venue}@{_fmt_float(o.buy_yes_price, 6)}"
+        no_part = f"{o.buy_no_venue}@{_fmt_float(o.buy_no_price, 6)}"
+        q = o.question
+        lines.append(f"{_fmt_float(o.edge, 6):<9} | {yes_part:<26} | {no_part:<26} | {q}")
     return "\n".join(lines)
 
 
-def run_scan(
-    provider_a: object,
-    provider_b: object,
-    min_edge: float = 0.0,
-) -> list[Opportunity]:
-    a_snaps = list(getattr(provider_a, "fetch_market_snapshots")())
-    b_snaps = list(getattr(provider_b, "fetch_market_snapshots")())
-    return compute_opportunities(a_snaps, b_snaps, min_edge=min_edge)
+def format_near_miss_pairs_table(
+    snapshots_a: list[MarketSnapshot],
+    snapshots_b: list[MarketSnapshot],
+    config: ScannerConfig,
+    limit: int = 20,
+) -> str:
+    """
+    Near-miss ranking.
+    - Si solo hay A (Kalshi): intra-market (yes_ask + no_ask) por snapshot.
+    - Si hay A y B: cross-venue near-miss para pares (dos direcciones).
+    """
+    rows: list[dict] = []
+
+    if not snapshots_b:
+        # Intra-market near-miss (Kalshi standalone)
+        for s in snapshots_a:
+            if not s.market.is_binary:
+                continue
+            y = _normalize_price_to_prob(s.orderbook.best_yes_price)
+            n = _normalize_price_to_prob(s.orderbook.best_no_price)
+            if y is None or n is None:
+                continue
+
+            cost = y + n
+            edge = 1.0 - cost - _fee_buffer(cost, config)
+            exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
+
+            rows.append(
+                {
+                    "market_id": s.market.market_id,
+                    "yes_ask": y,
+                    "no_ask": n,
+                    "sum_price": cost,
+                    "edge": edge,
+                    "executable_size": exe,
+                }
+            )
+    else:
+        # Cross-venue near-miss
+        for a, b in iter_pairs(snapshots_a, snapshots_b):
+            if not a.market.is_binary or not b.market.is_binary:
+                continue
+
+            a_yes = _normalize_price_to_prob(a.orderbook.best_yes_price)
+            a_no = _normalize_price_to_prob(a.orderbook.best_no_price)
+            b_yes = _normalize_price_to_prob(b.orderbook.best_yes_price)
+            b_no = _normalize_price_to_prob(b.orderbook.best_no_price)
+
+            # A yes + B no
+            if a_yes is not None and b_no is not None:
+                cost = a_yes + b_no
+                edge = 1.0 - cost - _fee_buffer(cost, config)
+                exe = min(
+                    float(a.orderbook.best_yes_size or 0),
+                    float(b.orderbook.best_no_size or 0),
+                )
+                rows.append(
+                    {
+                        "market_id": f"{a.market.venue}:{a.market.market_id} | {b.market.venue}:{b.market.market_id}",
+                        "yes_ask": a_yes,
+                        "no_ask": b_no,
+                        "sum_price": cost,
+                        "edge": edge,
+                        "executable_size": exe,
+                    }
+                )
+
+            # B yes + A no
+            if b_yes is not None and a_no is not None:
+                cost = b_yes + a_no
+                edge = 1.0 - cost - _fee_buffer(cost, config)
+                exe = min(
+                    float(b.orderbook.best_yes_size or 0),
+                    float(a.orderbook.best_no_size or 0),
+                )
+                rows.append(
+                    {
+                        "market_id": f"{b.market.venue}:{b.market.market_id} | {a.market.venue}:{a.market.market_id}",
+                        "yes_ask": b_yes,
+                        "no_ask": a_no,
+                        "sum_price": cost,
+                        "edge": edge,
+                        "executable_size": exe,
+                    }
+                )
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda r: r["edge"], reverse=True)
+    rows = rows[:limit]
+
+    lines = []
+    lines.append("MARKET_ID | YES_ASK | NO_ASK | SUM | EDGE | EXEC_SIZE")
+    lines.append("-" * 95)
+    for r in rows:
+        lines.append(
+            f"{r['market_id']} | "
+            f"{_fmt_float(r['yes_ask'], 6)} | "
+            f"{_fmt_float(r['no_ask'], 6)} | "
+            f"{_fmt_float(r['sum_price'], 6)} | "
+            f"{_fmt_float(r['edge'], 6)} | "
+            f"{_fmt_float(r['executable_size'], 2)}"
+        )
+    return "\n".join(lines)
