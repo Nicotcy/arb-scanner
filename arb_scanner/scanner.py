@@ -15,69 +15,58 @@ def summarize_config(config: object) -> str:
         pass
     return f"CONFIG {config!r}"
 
+_NEAR_MISS_ROWS: list[tuple[str, float, float, float, float, float]] = []
+
 
 def compute_opportunities(
     a_snapshots: Sequence[MarketSnapshot],
     b_snapshots: Sequence[MarketSnapshot],
     min_edge: float = 0.0,
 ) -> list[Opportunity]:
-    """
-    Match conservador: por texto exacto de 'question' + outcomes.
+    opportunities: list[Opportunity] = []
+    _NEAR_MISS_ROWS.clear()
 
-    Arbitraje (binario Yes/No):
-      - YES en A + NO en B si yes_ask(A) + no_ask(B) < 1
-      - NO en A + YES en B si no_ask(A) + yes_ask(B) < 1
-
-    edge = 1 - suma_asks
-    """
-    a_map: dict[tuple[str, tuple[str, ...]], MarketSnapshot] = {}
-    for s in a_snapshots:
-        key = (s.market.question, tuple(s.market.outcomes))
-        a_map[key] = s
-
-    opps: list[Opportunity] = []
-    for b in b_snapshots:
-        key = (b.market.question, tuple(b.market.outcomes))
-        a = a_map.get(key)
-        if not a:
-            continue
-
-        a_ob = a.orderbook
-        b_ob = b.orderbook
-
-        if a_ob.best_yes_price is None or a_ob.best_no_price is None:
-            continue
-        if b_ob.best_yes_price is None or b_ob.best_no_price is None:
-            continue
-
-        sum1 = float(a_ob.best_yes_price) + float(b_ob.best_no_price)
-        edge1 = 1.0 - sum1
-        if edge1 >= min_edge:
-            opps.append(
-                Opportunity(
-                    question=a.market.question,
-                    outcomes=a.market.outcomes,
-                    buy_yes_venue=a.market.venue,
-                    buy_yes_price=float(a_ob.best_yes_price),
-                    buy_no_venue=b.market.venue,
-                    buy_no_price=float(b_ob.best_no_price),
-                    edge=edge1,
+    for snap_a, snap_b in iter_pairs(markets_a, markets_b):
+        yes_price = snap_a.orderbook.best_yes_price
+        no_price = snap_b.orderbook.best_no_price
+        if (
+            snap_a.market.is_binary
+            and snap_b.market.is_binary
+            and yes_price is not None
+            and no_price is not None
+        ):
+            sum_price = yes_price + no_price
+            edge = 1.0 - sum_price
+            executable_size = min(
+                snap_a.orderbook.best_yes_size, snap_b.orderbook.best_no_size
+            )
+            _NEAR_MISS_ROWS.append(
+                (
+                    f"{snap_a.market.venue}:{snap_a.market.market_id} vs "
+                    f"{snap_b.market.venue}:{snap_b.market.market_id}",
+                    yes_price,
+                    no_price,
+                    sum_price,
+                    edge,
+                    executable_size,
                 )
             )
+        hedge_cost = yes_price + no_price
+        estimated_fees = hedge_cost * (config.fee_buffer_bps / 10_000)
+        top_liquidity = min(snap_a.orderbook.best_yes_size, snap_b.orderbook.best_no_size)
+        market_mismatch = not (snap_a.market.is_binary and snap_b.market.is_binary)
+        net_edge = 1.0 - (hedge_cost + estimated_fees)
 
-        sum2 = float(a_ob.best_no_price) + float(b_ob.best_yes_price)
-        edge2 = 1.0 - sum2
-        if edge2 >= min_edge:
-            opps.append(
-                Opportunity(
-                    question=a.market.question,
-                    outcomes=a.market.outcomes,
-                    buy_yes_venue=b.market.venue,
-                    buy_yes_price=float(b_ob.best_yes_price),
-                    buy_no_venue=a.market.venue,
-                    buy_no_price=float(a_ob.best_no_price),
-                    edge=edge2,
-                )
+        opportunities.append(
+            Opportunity(
+                market_pair=f"{snap_a.market.venue}:{snap_a.market.market_id} vs {snap_b.market.venue}:{snap_b.market.market_id}",
+                best_yes_price_A=yes_price,
+                best_no_price_B=no_price,
+                hedge_cost=hedge_cost,
+                estimated_fees=estimated_fees,
+                top_of_book_liquidity=top_liquidity,
+                market_mismatch=market_mismatch,
+                net_edge=net_edge,
             )
 
     opps.sort(key=lambda o: o.edge, reverse=True)

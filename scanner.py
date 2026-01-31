@@ -104,14 +104,21 @@ def main() -> int:
     if not snapshots_b:
         print(summarize_config(config))
         print("No opportunities found.")
+        near_miss_pairs = format_near_miss_pairs_table()
+        if near_miss_pairs:
+            print("Near-miss opportunities (top 20):")
+            print(near_miss_pairs)
+        else:
+            print("No valid binary markets for near-miss table.")
         return 0
 
-    opps = compute_opportunities(snapshots_a, snapshots_b, config)
-    print(summarize_config(config))
-    if opps:
-        print(format_opportunity_table(opps))
+    print(format_opportunity_table(opportunities))
+    near_miss_pairs = format_near_miss_pairs_table()
+    if near_miss_pairs:
+        print("Near-miss opportunities (top 20):")
+        print(near_miss_pairs)
     else:
-        print("No opportunities found.")
+        print("No valid binary markets for near-miss table.")
     return 0
 
 

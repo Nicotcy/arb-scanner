@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import os
 
-from arb_scanner.kalshi_public import KalshiPublicClient
+from arb_scanner.kalshi_public import KalshiPublicClient, normalize_kalshi_price
 from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
 from arb_scanner.sources.base import MarketDataProvider
 
