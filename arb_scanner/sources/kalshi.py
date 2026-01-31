@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable, Any
+from typing import Iterable
 
 from arb_scanner.kalshi_public import KalshiPublicClient
 from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
@@ -11,8 +11,11 @@ class KalshiProvider:
     """
     Read-only Kalshi snapshot provider.
 
-    Usamos el payload de list_open_markets (yes_ask/no_ask + qty). Es lo más
-    estable para un scanner read-only sin depender del endpoint de orderbook.
+    Nota importante:
+    - El endpoint /markets (list_open_markets) te está devolviendo casi todo como MVE
+      (market tipo "combo" con legs). Esos MVEs no sirven como tickers "subyacentes".
+    - Para un scanner útil, expandimos los MVEs a sus legs (market_ticker) y a esos
+      tickers les pedimos top-of-book (orderbook), que sí trae precios.
     """
 
     def __init__(self) -> None:
@@ -22,26 +25,25 @@ class KalshiProvider:
         return "Kalshi"
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
+        # Paging del listado
         max_pages = int(os.getenv("KALSHI_PAGES", "5"))
         limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
 
         markets = list(
-            self.client.list_open_markets(
-                max_pages=max_pages,
-                limit_per_page=limit_per_page,
-            )
+            self.client.list_open_markets(max_pages=max_pages, limit_per_page=limit_per_page)
         )
+
         markets_raw = markets
 
-        # Intento de filtrar MVEs umbrella (no tradeables directamente)
+        # Blacklist para reducir ruido (especialmente MVEs deportivos gigantes)
         blacklist_prefixes = ("KXMVE", "KXMVESPORTS")
         blacklist_substrings = ("MULTIGAMEEXTENDED",)
 
         markets_filtered = [
-            m
-            for m in markets
-            if not any((m.get("ticker") or "").startswith(p) for p in blacklist_prefixes)
-            and not any(s in (m.get("ticker") or "") for s in blacklist_substrings)
+            market
+            for market in markets
+            if not any((market.get("ticker") or "").startswith(prefix) for prefix in blacklist_prefixes)
+            and not any(sub in (market.get("ticker") or "") for sub in blacklist_substrings)
         ]
 
         min_after_blacklist = int(os.getenv("KALSHI_MIN_AFTER_BLACKLIST", "50"))
@@ -54,7 +56,7 @@ class KalshiProvider:
         else:
             markets = markets_filtered
 
-        # Mantener mercados activos si hay suficientes
+        # Filtrado por actividad (si quieres)
         min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
 
@@ -64,46 +66,38 @@ class KalshiProvider:
                 markets = sorted(active_markets, key=lambda m: m.get(key) or 0, reverse=True)
                 break
 
-        # Lookup por ticker usando RAW (para que existan los legs)
-        by_ticker: dict[str, dict[str, Any]] = {}
-        for m in markets_raw:
-            t = m.get("ticker")
-            if t:
-                by_ticker[t] = m
-
-        # Construir lista de tickers tradeables (expandiendo MVEs a legs)
+        # 1) Construimos lista de tickers tradeables:
+        #    - Si es MVE, usamos sus legs (market_ticker)
+        #    - Si no, usamos su ticker normal
         tickers_to_fetch: list[str] = []
         seen: set[str] = set()
 
-        for m in markets:
-            ticker = m.get("ticker")
-            if not ticker:
+        for market in markets:
+            t = market.get("ticker")
+            if not t:
                 continue
 
-            if ticker.startswith("KXMVE") or "MULTIGAMEEXTENDED" in ticker:
-                legs = m.get("mve_selected_legs") or []
+            legs = market.get("mve_selected_legs") or []
+            if legs:
                 for leg in legs:
                     leg_ticker = leg.get("market_ticker")
-                    if not leg_ticker or leg_ticker in seen:
-                        continue
-                    tickers_to_fetch.append(leg_ticker)
-                    seen.add(leg_ticker)
-                continue
+                    if leg_ticker and leg_ticker not in seen:
+                        tickers_to_fetch.append(leg_ticker)
+                        seen.add(leg_ticker)
+            else:
+                if t not in seen:
+                    tickers_to_fetch.append(t)
+                    seen.add(t)
 
-            if ticker not in seen:
-                tickers_to_fetch.append(ticker)
-                seen.add(ticker)
-
+        # 2) Snapshot fetch loop vía orderbook top
         require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
-       
-
         min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
 
         total = 0
         ok = 0
-        skipped_missing = 0
-        skipped_no_price = 0
-        skipped_liq = 0
+        fetch_errors = 0
+        noprices = 0
+        liqskip = 0
         one_sided = 0
         two_sided = 0
 
@@ -112,58 +106,58 @@ class KalshiProvider:
                 break
             total += 1
 
-            m = by_ticker.get(ticker)
-            if not m:
-                skipped_missing += 1
+            try:
+                top = self.client.fetch_top_of_book(ticker)
+            except Exception:
+                fetch_errors += 1
                 continue
 
-            yes_ask = m.get("yes_ask")
-            no_ask = m.get("no_ask")
+            has_yes = top.yes_ask is not None
+            has_no = top.no_ask is not None
 
-            if yes_ask is None or no_ask is None:
-                skipped_no_price += 1
+            # Si no hay precios, fuera
+            if not has_yes and not has_no:
+                noprices += 1
                 continue
 
-            yes_price = float(yes_ask) / 100.0
-            no_price = float(no_ask) / 100.0
-
-            yes_size = float(m.get("yes_ask_qty") or 0)
-            no_size = float(m.get("no_ask_qty") or 0)
-
-            has_yes = yes_ask is not None
-            has_no = no_ask is not None
-
+            # Si exiges dos lados, y falta uno, fuera
             if require_two_sided and not (has_yes and has_no):
+                one_sided += 1
                 continue
 
+            yes_size = float(top.yes_ask_qty or 0)
+            no_size = float(top.no_ask_qty or 0)
+
+            # Si hay ambos lados, imponemos liquidez mínima top-of-book
             if has_yes and has_no and min(yes_size, no_size) < min_liq:
-                skipped_liq += 1
+                liqskip += 1
                 continue
 
-            ok += 1
             if has_yes and has_no:
                 two_sided += 1
             else:
                 one_sided += 1
 
-            yield MarketSnapshot(
+            snapshot = MarketSnapshot(
                 market=Market(
                     venue=self.name(),
                     market_id=ticker,
-                    question=m.get("title") or ticker,
+                    question=ticker,
                     outcomes=("Yes", "No"),
                 ),
                 orderbook=OrderBookTop(
-                    best_yes_price=yes_price,
+                    best_yes_price=top.yes_ask,
                     best_yes_size=yes_size,
-                    best_no_price=no_price,
+                    best_no_price=top.no_ask,
                     best_no_size=no_size,
                 ),
             )
+            ok += 1
+            yield snapshot
 
         print(
             "KalshiProvider stats: "
-            f"total={total} ok={ok} "
-            f"missing={skipped_missing} noprices={skipped_no_price} liqskip={skipped_liq} "
+            f"total={total} ok={ok} errors={fetch_errors} "
+            f"noprices={noprices} liqskip={liqskip} "
             f"one_sided={one_sided} two_sided={two_sided}"
         )
