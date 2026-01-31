@@ -118,7 +118,7 @@ def main() -> int:
         print("No opportunities found.")
 
     # Near-miss: se puede imprimir aunque solo haya Kalshi (si la función está implementada así)
-    near_miss_pairs = format_near_miss_pairs_table()
+    near_miss_pairs = format_near_miss_pairs_table(snapshots_a, snapshots_b, config)
     if near_miss_pairs:
         print("Near-miss opportunities (top 20):")
         print(near_miss_pairs)
