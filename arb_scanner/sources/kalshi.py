@@ -52,89 +52,73 @@ class KalshiProvider(MarketDataProvider):
             markets = markets_raw
         else:
             markets = markets_filtered
-
-        # Filtrado por actividad (si quieres)
         min_active = int(os.getenv("KALSHI_MIN_ACTIVE", "50"))
         max_tickers = int(os.getenv("KALSHI_MAX_TICKERS", "300"))
-
         for key in ("volume_24h", "volume", "open_interest"):
-            active_markets = [m for m in markets if (m.get(key) or 0) > 0]
+            active_markets = [
+                market
+                for market in markets
+                if (market.get(key) or 0) > 0
+            ]
             if len(active_markets) >= min_active:
-                markets = sorted(active_markets, key=lambda m: m.get(key) or 0, reverse=True)
+                markets = sorted(
+                    active_markets,
+                    key=lambda market: market.get(key) or 0,
+                    reverse=True,
+                )
                 break
-
-        # 1) Construimos lista de tickers tradeables:
-        #    - Si es MVE, usamos sus legs (market_ticker)
-        #    - Si no, usamos su ticker normal
         tickers_to_fetch: list[str] = []
-        seen: set[str] = set()
-
+        seen_tickers: set[str] = set()
         for market in markets:
-            t = market.get("ticker")
-            if not t:
+            ticker = market.get("ticker")
+            if ticker:
+                if ticker not in seen_tickers:
+                    tickers_to_fetch.append(ticker)
+                    seen_tickers.add(ticker)
                 continue
-
             legs = market.get("mve_selected_legs") or []
-            if legs:
-                for leg in legs:
-                    leg_ticker = leg.get("market_ticker")
-                    if leg_ticker and leg_ticker not in seen:
-                        tickers_to_fetch.append(leg_ticker)
-                        seen.add(leg_ticker)
-            else:
-                if t not in seen:
-                    tickers_to_fetch.append(t)
-                    seen.add(t)
-
-        # 2) Snapshot fetch loop vía orderbook top
+            for leg in legs:
+                leg_ticker = leg.get("market_ticker")
+                if not leg_ticker or leg_ticker in seen_tickers:
+                    continue
+                tickers_to_fetch.append(leg_ticker)
+                seen_tickers.add(leg_ticker)
+        total_tickers = 0
+        fetched_ok = 0
+        fetch_errors = 0
+        no_asks_both_sides = 0
+        one_sided_only = 0
+        two_sided = 0
         require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") == "1"
         min_liq = float(os.getenv("KALSHI_MIN_LIQ", "1"))
-
-        total = 0
-        ok = 0
-        fetch_errors = 0
-        noprices = 0
-        liqskip = 0
-        one_sided = 0
-        two_sided = 0
-
         for ticker in tickers_to_fetch:
-            if total >= max_tickers:
+            if total_tickers >= max_tickers:
                 break
-            total += 1
-
+            total_tickers += 1
             try:
-                top = self.client.fetch_top_of_book(ticker)
+                top = client.fetch_top_of_book(ticker)
             except Exception:
                 fetch_errors += 1
                 continue
-
-            has_yes = top.yes_ask is not None
-            has_no = top.no_ask is not None
-
-            # Si no hay precios, fuera
-            if not has_yes and not has_no:
-                noprices += 1
+            fetched_ok += 1
+            has_any_bid = top.yes_bid is not None or top.no_bid is not None
+            has_yes_ask = top.yes_ask is not None
+            has_no_ask = top.no_ask is not None
+            if not has_yes_ask and not has_no_ask:
+                no_asks_both_sides += 1
                 continue
-
-            # Si exiges dos lados, y falta uno, fuera
-            if require_two_sided and not (has_yes and has_no):
-                one_sided += 1
-                continue
-
-            yes_size = float(top.yes_ask_qty or 0)
-            no_size = float(top.no_ask_qty or 0)
-
-            # Si hay ambos lados, imponemos liquidez mínima top-of-book
-            if has_yes and has_no and min(yes_size, no_size) < min_liq:
-                liqskip += 1
-                continue
-
-            if has_yes and has_no:
+            if has_yes_ask and has_no_ask:
                 two_sided += 1
             else:
-                one_sided += 1
-
+                one_sided_only += 1
+            if require_two_sided and not (has_yes_ask and has_no_ask):
+                continue
+            yes_size = float(top.yes_ask_qty or 0)
+            no_size = float(top.no_ask_qty or 0)
+            yes_ask = normalize_kalshi_price(top.yes_ask)
+            no_ask = normalize_kalshi_price(top.no_ask)
+            if has_yes_ask and has_no_ask and min(yes_size, no_size) < min_liq:
+                continue
             snapshot = MarketSnapshot(
                 market=Market(
                     venue=self.name(),
