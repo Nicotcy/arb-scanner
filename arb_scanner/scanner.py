@@ -49,3 +49,58 @@ def format_opportunity_table(opportunities: Iterable[Opportunity]) -> str:
 def summarize_config(config: ScannerConfig) -> str:
     values = asdict(config)
     return ", ".join(f"{key}={value}" for key, value in values.items())
+
+
+def format_near_miss_table(markets: Iterable[MarketSnapshot]) -> str:
+    rows: list[tuple[str, float, float, float, float, float, float]] = []
+    for snapshot in markets:
+        if not snapshot.market.is_binary:
+            continue
+        yes_ask = snapshot.orderbook.best_yes_price
+        no_ask = snapshot.orderbook.best_no_price
+        if yes_ask is None or no_ask is None:
+            continue
+        yes_qty = snapshot.orderbook.best_yes_size
+        no_qty = snapshot.orderbook.best_no_size
+        sum_price = yes_ask + no_ask
+        edge = 1.0 - sum_price
+        rows.append(
+            (
+                snapshot.market.market_id,
+                yes_ask,
+                yes_qty,
+                no_ask,
+                no_qty,
+                sum_price,
+                edge,
+            )
+        )
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda row: row[-1], reverse=True)
+    rows = rows[:20]
+
+    lines = [
+        "market_id yes_ask yes_qty no_ask no_qty sum_price edge",
+    ]
+    for (
+        market_id,
+        yes_ask,
+        yes_qty,
+        no_ask,
+        no_qty,
+        sum_price,
+        edge,
+    ) in rows:
+        lines.append(
+            f"{market_id} "
+            f"{yes_ask:.4f} "
+            f"{yes_qty:.4f} "
+            f"{no_ask:.4f} "
+            f"{no_qty:.4f} "
+            f"{sum_price:.4f} "
+            f"{edge:.4f}"
+        )
+    return "\n".join(lines)
