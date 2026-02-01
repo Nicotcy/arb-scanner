@@ -98,7 +98,6 @@ def compute_opportunities(
     opps.sort(key=lambda o: o.edge, reverse=True)
     return opps
 
-
 def format_opportunity_table(opps: list[Opportunity], limit: int = 20) -> str:
     if not opps:
         return "No opportunities found."
@@ -125,8 +124,11 @@ def format_near_miss_pairs_table(
 ) -> str:
     """
     Near-miss ranking.
-    - Si solo hay A (Kalshi): intra-market (yes_ask + no_ask) por snapshot.
-    - Si hay A y B: cross-venue near-miss para pares (dos direcciones).
+
+    Intra-market (solo Kalshi): usamos yes_ask + no_ask SOLO si se comporta como binario real,
+    es decir, la suma está cerca de 1. Si no, lo consideramos artefacto/fantasma y lo ignoramos.
+
+    Cross-venue (A+B): calculamos las dos direcciones (A yes + B no) y (B yes + A no).
     """
     rows: list[dict] = []
 
@@ -135,6 +137,7 @@ def format_near_miss_pairs_table(
         for s in snapshots_a:
             if not s.market.is_binary:
                 continue
+
             y = _normalize_price_to_prob(s.orderbook.best_yes_price)
             n = _normalize_price_to_prob(s.orderbook.best_no_price)
             if y is None or n is None:
@@ -143,13 +146,12 @@ def format_near_miss_pairs_table(
             cost = y + n
 
             # Filtro anti-fantasmas:
-            # En binarios reales, yes_ask + no_ask debería estar cerca de 1.
-            # Si sale algo tipo 0.02, es un artefacto / interpretación inválida.
+            # En un binario "normal" (comprar YES + comprar NO) la suma suele estar ~1.
+            # Si sale 0.02, 0.10, etc., NO es interpretable como binario ejecutable.
             if cost < 0.90 or cost > 1.10:
                 continue
 
             edge = 1.0 - cost - _fee_buffer(cost, config)
-
             exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
 
             rows.append(
@@ -177,10 +179,7 @@ def format_near_miss_pairs_table(
             if a_yes is not None and b_no is not None:
                 cost = a_yes + b_no
                 edge = 1.0 - cost - _fee_buffer(cost, config)
-                exe = min(
-                    float(a.orderbook.best_yes_size or 0),
-                    float(b.orderbook.best_no_size or 0),
-                )
+                exe = min(float(a.orderbook.best_yes_size or 0), float(b.orderbook.best_no_size or 0))
                 rows.append(
                     {
                         "market_id": f"{a.market.venue}:{a.market.market_id} | {b.market.venue}:{b.market.market_id}",
@@ -196,10 +195,7 @@ def format_near_miss_pairs_table(
             if b_yes is not None and a_no is not None:
                 cost = b_yes + a_no
                 edge = 1.0 - cost - _fee_buffer(cost, config)
-                exe = min(
-                    float(b.orderbook.best_yes_size or 0),
-                    float(a.orderbook.best_no_size or 0),
-                )
+                exe = min(float(b.orderbook.best_yes_size or 0), float(a.orderbook.best_no_size or 0))
                 rows.append(
                     {
                         "market_id": f"{b.market.venue}:{b.market.market_id} | {a.market.venue}:{a.market.market_id}",
