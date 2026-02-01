@@ -141,7 +141,15 @@ def format_near_miss_pairs_table(
                 continue
 
             cost = y + n
+
+            # Filtro anti-fantasmas:
+            # En binarios reales, yes_ask + no_ask debería estar cerca de 1.
+            # Si sale algo tipo 0.02, es un artefacto / interpretación inválida.
+            if cost < 0.90 or cost > 1.10:
+                continue
+
             edge = 1.0 - cost - _fee_buffer(cost, config)
+
             exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
 
             rows.append(
