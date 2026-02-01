@@ -6,6 +6,9 @@ import os
 from arb_scanner.config import load_config
 from arb_scanner.sources.kalshi import KalshiProvider
 from arb_scanner.sources.stub import StubProvider
+from arb_scanner.mappings import load_manual_mappings
+from arb_scanner.sources.polymarket_stub import PolymarketStubProvider
+
 
 # Importamos TODO lo que vamos a usar del módulo core
 from arb_scanner.scanner import (
@@ -21,6 +24,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--use-stub", action="store_true", help="Use stub providers.")
     parser.add_argument("--use-kalshi", action="store_true", help="Use Kalshi read-only snapshots.")
+    parser.add_argument(
+        "--use-mapping",
+        action="store_true",
+        help="Use manual Kalshi<->Polymarket mappings (Polymarket stub for now).",
+    )
 
     parser.add_argument(
         "--kalshi-market-prices",
@@ -44,6 +52,21 @@ def main() -> int:
         provider_b = StubProvider("Polymarket")
         snapshots_a = list(provider_a.fetch_market_snapshots())
         snapshots_b = list(provider_b.fetch_market_snapshots())
+        elif args.use_mapping:
+        # 1) Kalshi snapshots
+        provider_a = KalshiProvider()
+        snapshots_a = list(provider_a.fetch_market_snapshots())
+
+        # 2) Polymarket stub (por ahora vacío)
+        provider_b = PolymarketStubProvider()
+        snapshots_b = list(provider_b.fetch_market_snapshots())
+
+        # 3) Mappings manuales
+        mappings = load_manual_mappings()
+        if not mappings:
+            print(summarize_config(config))
+            print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
+            return 0
 
     elif args.kalshi_market_prices:
         from arb_scanner.kalshi_public import KalshiPublicClient
