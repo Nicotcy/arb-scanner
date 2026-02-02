@@ -59,6 +59,13 @@ def parse_args() -> argparse.Namespace:
         help="Probe multiple Kalshi endpoints for a ticker and print response shapes.",
     )
 
+    parser.add_argument(
+        "--debug-kalshi-top",
+        type=str,
+        default="",
+        help="Print computed Kalshi top-of-book (bid/ask) for a ticker and exit.",
+    )
+
     return parser.parse_args()
 
 
@@ -172,7 +179,6 @@ def main() -> int:
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
 
-    # Debug raw Kalshi orderbook JSON for one ticker
     if args.debug_kalshi_orderbook:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
@@ -181,13 +187,20 @@ def main() -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
-    # Probe multiple endpoints for one ticker (shape discovery)
     if args.probe_kalshi:
         from arb_scanner.kalshi_public import KalshiPublicClient
 
         client = KalshiPublicClient()
         results = client.probe_endpoints(args.probe_kalshi.strip())
         print(json.dumps(results, indent=2, sort_keys=True))
+        return 0
+
+    if args.debug_kalshi_top:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        client = KalshiPublicClient()
+        top = client.fetch_top_of_book(args.debug_kalshi_top.strip())
+        print(top)
         return 0
 
     snapshots_a = []
