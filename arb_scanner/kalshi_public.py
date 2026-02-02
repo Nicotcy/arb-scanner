@@ -8,11 +8,13 @@ Asks can be derived via complementarity in binary markets:
 - NO ask at price B is equivalent to a YES bid at (100 - B)
   => NO_ASK  = 100 - YES_BID
 
-Docs:
-- Get Market Orderbook: orderbook shows active bid orders only.
-- Orderbook responses: explains why only bids are returned.
+We compute top-of-book bid/ask from returned bids.
 
-We therefore compute top-of-book bid/ask from returned bids.
+IMPORTANT (2026 reality check):
+- /markets?status=open often includes many multivariate (MVE / combo) tickers (e.g., KXMVE...).
+  Those are NOT standard binary YES/NO markets with the normal orderbook shape.
+- For a practical scanner, enumerating from /events with nested markets is more reliable:
+  GET /events?status=open&with_nested_markets=true
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
@@ -55,7 +57,28 @@ class KalshiPublicClient:
         )
         self.timeout = float(os.getenv("KALSHI_TIMEOUT", "15"))
 
-    def list_open_markets(self, max_pages: int = 3, limit_per_page: int = 200):
+        # How to enumerate "open" tradeable markets:
+        # - "events" is recommended (filters out lots of MVE junk for scanner purposes)
+        # - "markets" is legacy (can be MVE-heavy)
+        self.market_list_source = os.getenv("KALSHI_MARKET_LIST_SOURCE", "events").strip().lower()
+
+    def list_open_markets(self, max_pages: int = 3, limit_per_page: int = 200) -> Iterable[dict[str, Any]]:
+        """
+        Yields *market objects* (dicts) that are likely binary tradeable markets.
+
+        Default strategy: enumerate open EVENTS with nested markets and yield those markets.
+        This avoids the situation where /markets?status=open is dominated by MVE/combos.
+
+        Env override:
+          KALSHI_MARKET_LIST_SOURCE=markets  -> use /markets directly (legacy)
+          KALSHI_MARKET_LIST_SOURCE=events   -> use /events with nested markets (default)
+        """
+        if self.market_list_source == "markets":
+            yield from self._list_open_markets_from_markets(max_pages=max_pages, limit_per_page=limit_per_page)
+            return
+        yield from self._list_open_markets_from_events(max_pages=max_pages, limit_per_page=limit_per_page)
+
+    def _list_open_markets_from_markets(self, max_pages: int = 3, limit_per_page: int = 200):
         cursor = None
         pages = 0
 
@@ -64,9 +87,54 @@ class KalshiPublicClient:
             if cursor:
                 params["cursor"] = cursor
             payload = self._get("/markets", params=params)
+
             markets = payload.get("markets") or []
             for m in markets:
+                ticker = (m.get("ticker") or "").strip()
+                if not ticker:
+                    continue
+                # Filter obvious MVEs/combos by ticker prefix (conservative)
+                if ticker.upper().startswith("KXMVE"):
+                    continue
                 yield m
+
+            cursor = payload.get("cursor")
+            pages += 1
+            if not cursor:
+                break
+
+    def _list_open_markets_from_events(self, max_pages: int = 3, limit_per_page: int = 200):
+        cursor = None
+        pages = 0
+
+        while pages < max_pages:
+            params: dict[str, Any] = {
+                "status": "open",
+                "limit": limit_per_page,
+                "with_nested_markets": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            payload = self._get("/events", params=params)
+
+            events = payload.get("events") or []
+            for ev in events:
+                markets = ev.get("markets") or []
+                if not isinstance(markets, list):
+                    continue
+
+                for m in markets:
+                    if not isinstance(m, dict):
+                        continue
+                    ticker = (m.get("ticker") or "").strip()
+                    if not ticker:
+                        continue
+                    # Filter obvious MVEs/combos by ticker prefix (conservative)
+                    if ticker.upper().startswith("KXMVE"):
+                        continue
+                    yield m
+
             cursor = payload.get("cursor")
             pages += 1
             if not cursor:
@@ -110,10 +178,6 @@ class KalshiPublicClient:
         Derived asks:
         - yes_ask_cents = 100 - no_bid_cents
         - no_ask_cents  = 100 - yes_bid_cents
-
-        Quantities:
-        - yes_ask_qty corresponds to size at NO bid level used for derivation
-        - no_ask_qty  corresponds to size at YES bid level used for derivation
         """
         payload = self.get_orderbook(ticker, depth=1)
         ob = payload.get("orderbook") if isinstance(payload, dict) else None
@@ -126,18 +190,15 @@ class KalshiPublicClient:
         yes_bid_cents, yes_bid_qty = _best_bid_from_levels(yes_list)
         no_bid_cents, no_bid_qty = _best_bid_from_levels(no_list)
 
-        # Convert bids to dollars
         yes_bid = _cents_to_dollars(yes_bid_cents)
         no_bid = _cents_to_dollars(no_bid_cents)
 
-        # Derive asks (still in cents)
         yes_ask_cents = (100 - no_bid_cents) if no_bid_cents is not None else None
         no_ask_cents = (100 - yes_bid_cents) if yes_bid_cents is not None else None
 
         yes_ask = _cents_to_dollars(yes_ask_cents)
         no_ask = _cents_to_dollars(no_ask_cents)
 
-        # Derived ask sizes come from the complementary bid sizes
         yes_ask_qty = float(no_bid_qty) if no_bid_qty is not None else None
         no_ask_qty = float(yes_bid_qty) if yes_bid_qty is not None else None
 
@@ -177,11 +238,6 @@ class KalshiPublicClient:
 
 
 def _best_bid_from_levels(levels: Any) -> tuple[int | None, float | None]:
-    """
-    levels is typically a list like [[price_cents, qty], ...]
-    With depth=1 it should be exactly one element: top bid.
-    We still handle general cases.
-    """
     if not isinstance(levels, list) or not levels:
         return None, None
 
@@ -241,12 +297,4 @@ def _summarize_payload(path: str, payload: Any) -> dict[str, Any]:
                 if isinstance(v, list):
                     summary[f"{side}_len"] = len(v)
                     summary[f"{side}_head"] = v[:3]
-        return summary
-
-    if isinstance(payload, list):
-        summary["len"] = len(payload)
-        summary["head"] = payload[:3]
-        return summary
-
     return summary
-
