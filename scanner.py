@@ -52,6 +52,13 @@ def parse_args() -> argparse.Namespace:
         help="Print raw Kalshi orderbook JSON for a specific ticker and exit.",
     )
 
+    parser.add_argument(
+        "--probe-kalshi",
+        type=str,
+        default="",
+        help="Probe multiple Kalshi endpoints for a ticker and print response shapes.",
+    )
+
     return parser.parse_args()
 
 
@@ -77,9 +84,20 @@ def _is_any_sports(ticker: str) -> bool:
 def _looks_like_player_prop(ticker: str) -> bool:
     t = ticker.upper()
     prop_markers = (
-        "PTS", "REB", "AST", "STL", "BLK", "3PT",
-        "RSH", "PASS", "REC", "TD", "YDS",
-        "GOALS", "SACK", "INT",
+        "PTS",
+        "REB",
+        "AST",
+        "STL",
+        "BLK",
+        "3PT",
+        "RSH",
+        "PASS",
+        "REC",
+        "TD",
+        "YDS",
+        "GOALS",
+        "SACK",
+        "INT",
         "BTTS",
     )
     return any(m in t for m in prop_markers)
@@ -161,6 +179,15 @@ def main() -> int:
         client = KalshiPublicClient()
         payload = client.get_orderbook(args.debug_kalshi_orderbook.strip())
         print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    # Probe multiple endpoints for one ticker (shape discovery)
+    if args.probe_kalshi:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        client = KalshiPublicClient()
+        results = client.probe_endpoints(args.probe_kalshi.strip())
+        print(json.dumps(results, indent=2, sort_keys=True))
         return 0
 
     snapshots_a = []
