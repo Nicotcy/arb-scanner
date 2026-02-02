@@ -5,29 +5,23 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MarketMapping:
-    """
-    Mapping explícito de un mercado binario equivalente entre venues.
-
-    kalshi_ticker:
-      - ticker tradeable de Kalshi (leg ticker si viene de MVE).
-    polymarket_slug:
-      - por ahora un identificador humano (slug o texto corto).
-      - cuando implementemos Polymarket real, lo cambiaremos a condition_id/token_id.
-    """
     kalshi_ticker: str
     polymarket_slug: str
+
+    # Optional: resolved from Gamma clobTokenIds (YES, NO)
+    polymarket_yes_token_id: str | None = None
+    polymarket_no_token_id: str | None = None
 
 
 def load_manual_mappings() -> list[MarketMapping]:
     """
-    Añade aquí tus pares 100% equivalentes.
-
-    Reglas para que sea "seguro":
-      - eventos con resolución objetiva (elecciones, datos oficiales, fechas, macro)
-      - evitar deportes y props (lesiones, anulaciones, reglas distintas)
-      - evitar mercados con posibilidad de void/cancel diferente entre plataformas
+    Add your mappings here. Start with a few, test, then expand.
+    You can omit token_ids; the scanner will try to resolve them via Gamma.
     """
     return [
-        # Ejemplo de formato (BORRA el # cuando tengas uno real):
-        # MarketMapping(kalshi_ticker="KXUSPR2028-TRUMP", polymarket_slug="will-donald-trump-win-2028"),
+        # Example:
+        # MarketMapping(
+        #   kalshi_ticker="KX....",
+        #   polymarket_slug="will-bitcoin-reach-100k-by-2025",
+        # ),
     ]
