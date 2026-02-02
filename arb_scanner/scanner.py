@@ -16,6 +16,7 @@ def summarize_config(config: ScannerConfig) -> str:
         f"min_edge_opportunity={config.min_edge_opportunity} "
         f"min_exec_size={config.min_executable_size} "
         f"near_miss_floor={config.near_miss_edge_floor} "
+        f"near_miss_ceiling={config.near_miss_edge_ceiling} "
         f"include_weird_sums={config.near_miss_include_weird_sums} "
         f"alert_only={config.alert_only} "
         f"alert_threshold={config.alert_threshold} "
@@ -208,7 +209,11 @@ def format_near_miss_pairs_table(
     rows: list[dict] = []
 
     def _keep(edge: float, exe: float) -> bool:
-        return edge >= config.near_miss_edge_floor and exe >= config.min_executable_size
+        if edge < config.near_miss_edge_floor:
+            return False
+        if config.near_miss_edge_ceiling is not None and edge > config.near_miss_edge_ceiling:
+            return False
+        return exe >= config.min_executable_size
 
     if not snapshots_b:
         # Intra-market near-miss (Kalshi standalone)
@@ -324,7 +329,11 @@ def format_near_miss_pairs_table_from_mapping_pairs(
     rows: list[dict] = []
 
     def _keep(edge: float, exe: float) -> bool:
-        return edge >= config.near_miss_edge_floor and exe >= config.min_executable_size
+        if edge < config.near_miss_edge_floor:
+            return False
+        if config.near_miss_edge_ceiling is not None and edge > config.near_miss_edge_ceiling:
+            return False
+        return exe >= config.min_executable_size
 
     for mp in mappings:
         k = k_idx.get(mp.kalshi_ticker)
