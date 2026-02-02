@@ -112,11 +112,6 @@ def compute_opportunities_from_mapping_pairs(
     mappings: list[MarketMapping],
     config: ScannerConfig,
 ) -> list[Opportunity]:
-    """
-    Compute cross-venue opportunities using explicit mapping pairs:
-    kalshi market_id == kalshi_ticker
-    polymarket market_id == polymarket_slug
-    """
     k_idx = _index_by_market_id(kalshi_snaps)
     p_idx = _index_by_market_id(poly_snaps)
 
@@ -136,7 +131,6 @@ def compute_opportunities_from_mapping_pairs(
         p_yes = _normalize_price_to_prob(p.orderbook.best_yes_price)
         p_no = _normalize_price_to_prob(p.orderbook.best_no_price)
 
-        # Direction 1: buy YES on Kalshi + buy NO on Polymarket
         if k_yes is not None and p_no is not None:
             cost = k_yes + p_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -156,7 +150,6 @@ def compute_opportunities_from_mapping_pairs(
                     )
                 )
 
-        # Direction 2: buy YES on Polymarket + buy NO on Kalshi
         if p_yes is not None and k_no is not None:
             cost = p_yes + k_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -200,6 +193,67 @@ def format_opportunity_table(opps: list[Opportunity], limit: int = 20) -> str:
     return "\n".join(lines)
 
 
+def format_tightest_markets_table(
+    snapshots: list[MarketSnapshot],
+    config: ScannerConfig,
+    limit: int = 20,
+) -> str:
+    """Internal (single-venue) view: show markets closest to being hedgeable (highest edge), even if negative."""
+    rows: list[dict] = []
+
+    for s in snapshots:
+        if not s.market.is_binary:
+            continue
+
+        y = _normalize_price_to_prob(s.orderbook.best_yes_price)
+        n = _normalize_price_to_prob(s.orderbook.best_no_price)
+        if y is None or n is None:
+            continue
+
+        cost = y + n
+        edge = 1.0 - cost - _fee_buffer(cost, config)
+        exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
+        if exe < config.min_executable_size:
+            continue
+
+        normal_like = 0.90 <= cost <= 1.10
+        if not normal_like and not config.near_miss_include_weird_sums:
+            continue
+
+        rows.append(
+            {
+                "market_id": s.market.market_id,
+                "yes_ask": y,
+                "no_ask": n,
+                "sum_price": cost,
+                "edge": edge,
+                "executable_size": exe,
+                "flag": "OK" if normal_like else "WEIRD_SUM",
+            }
+        )
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda r: r["edge"], reverse=True)
+    rows = rows[:limit]
+
+    lines: list[str] = []
+    lines.append("MARKET_ID | YES_ASK | NO_ASK | SUM | EDGE | EXEC | FLAG")
+    lines.append("-" * 120)
+    for r in rows:
+        lines.append(
+            f"{r['market_id']} | "
+            f"{r['yes_ask']:.6f} | "
+            f"{r['no_ask']:.6f} | "
+            f"{r['sum_price']:.6f} | "
+            f"{r['edge']:.6f} | "
+            f"{r['executable_size']:.2f} | "
+            f"{r['flag']}"
+        )
+    return "\n".join(lines)
+
+
 def format_near_miss_pairs_table(
     snapshots_a: list[MarketSnapshot],
     snapshots_b: list[MarketSnapshot],
@@ -216,7 +270,6 @@ def format_near_miss_pairs_table(
         return exe >= config.min_executable_size
 
     if not snapshots_b:
-        # Intra-market near-miss (Kalshi standalone)
         for s in snapshots_a:
             if not s.market.is_binary:
                 continue
@@ -250,7 +303,6 @@ def format_near_miss_pairs_table(
                 }
             )
     else:
-        # Cross-venue near-miss by question pairing
         for a, b in iter_pairs(snapshots_a, snapshots_b):
             if not a.market.is_binary or not b.market.is_binary:
                 continue
@@ -348,7 +400,6 @@ def format_near_miss_pairs_table_from_mapping_pairs(
         p_yes = _normalize_price_to_prob(p.orderbook.best_yes_price)
         p_no = _normalize_price_to_prob(p.orderbook.best_no_price)
 
-        # k_yes + p_no
         if k_yes is not None and p_no is not None:
             cost = k_yes + p_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -366,7 +417,6 @@ def format_near_miss_pairs_table_from_mapping_pairs(
                     }
                 )
 
-        # p_yes + k_no
         if p_yes is not None and k_no is not None:
             cost = p_yes + k_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
