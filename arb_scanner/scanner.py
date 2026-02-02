@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Iterable
 
 from arb_scanner.config import ScannerConfig
+from arb_scanner.mappings import MarketMapping
 from arb_scanner.models import MarketSnapshot, Opportunity, iter_pairs
 
 
@@ -22,10 +24,6 @@ def summarize_config(config: ScannerConfig) -> str:
 
 
 def _normalize_price_to_prob(price: float | None) -> float | None:
-    """
-    Normalize price to probability 0..1.
-    Kalshi suele venir en "cents" 0..100. Si viene ya en 0..1, lo deja.
-    """
     if price is None:
         return None
     p = float(price)
@@ -38,14 +36,7 @@ def _fee_buffer(cost: float, config: ScannerConfig) -> float:
     return cost * (config.fee_buffer_bps / 10_000.0)
 
 
-def _fmt_float(x: float | None, nd: int = 6) -> str:
-    if x is None:
-        return "-"
-    return f"{x:.{nd}f}"
-
-
 def _min_edge_for_opportunities(config: ScannerConfig) -> float:
-    # Backwards compat: ALERT_ONLY uses ALERT_THRESHOLD as the gate.
     if config.alert_only:
         return config.alert_threshold
     return config.min_edge_opportunity
@@ -56,10 +47,6 @@ def compute_opportunities(
     snapshots_b: Iterable[MarketSnapshot],
     config: ScannerConfig,
 ) -> list[Opportunity]:
-    """
-    Cross-venue opportunities.
-    Matching por (normalize_question(question), outcomes) vía iter_pairs() en models.py.
-    """
     opps: list[Opportunity] = []
     min_edge = _min_edge_for_opportunities(config)
 
@@ -72,7 +59,6 @@ def compute_opportunities(
         b_yes = _normalize_price_to_prob(b.orderbook.best_yes_price)
         b_no = _normalize_price_to_prob(b.orderbook.best_no_price)
 
-        # Case 1: Buy YES in A + Buy NO in B
         if a_yes is not None and b_no is not None:
             cost = a_yes + b_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -92,7 +78,6 @@ def compute_opportunities(
                     )
                 )
 
-        # Case 2: Buy YES in B + Buy NO in A
         if b_yes is not None and a_no is not None:
             cost = b_yes + a_no
             edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -116,6 +101,84 @@ def compute_opportunities(
     return opps
 
 
+def _index_by_market_id(snapshots: Iterable[MarketSnapshot]) -> dict[str, MarketSnapshot]:
+    return {s.market.market_id: s for s in snapshots}
+
+
+def compute_opportunities_from_mapping_pairs(
+    kalshi_snaps: list[MarketSnapshot],
+    poly_snaps: list[MarketSnapshot],
+    mappings: list[MarketMapping],
+    config: ScannerConfig,
+) -> list[Opportunity]:
+    """
+    Compute cross-venue opportunities using explicit mapping pairs:
+    kalshi market_id == kalshi_ticker
+    polymarket market_id == polymarket_slug
+    """
+    k_idx = _index_by_market_id(kalshi_snaps)
+    p_idx = _index_by_market_id(poly_snaps)
+
+    opps: list[Opportunity] = []
+    min_edge = _min_edge_for_opportunities(config)
+
+    for mp in mappings:
+        k = k_idx.get(mp.kalshi_ticker)
+        p = p_idx.get(mp.polymarket_slug)
+        if not k or not p:
+            continue
+        if not k.market.is_binary or not p.market.is_binary:
+            continue
+
+        k_yes = _normalize_price_to_prob(k.orderbook.best_yes_price)
+        k_no = _normalize_price_to_prob(k.orderbook.best_no_price)
+        p_yes = _normalize_price_to_prob(p.orderbook.best_yes_price)
+        p_no = _normalize_price_to_prob(p.orderbook.best_no_price)
+
+        # Direction 1: buy YES on Kalshi + buy NO on Polymarket
+        if k_yes is not None and p_no is not None:
+            cost = k_yes + p_no
+            edge = 1.0 - cost - _fee_buffer(cost, config)
+            exe = min(float(k.orderbook.best_yes_size or 0), float(p.orderbook.best_no_size or 0))
+            if edge >= min_edge and exe >= config.min_executable_size:
+                opps.append(
+                    Opportunity(
+                        question=f"{k.market.market_id} ↔ {p.market.market_id}",
+                        outcomes=("YES", "NO"),
+                        buy_yes_venue=k.market.venue,
+                        buy_yes_price=k_yes,
+                        buy_no_venue=p.market.venue,
+                        buy_no_price=p_no,
+                        sum_price=cost,
+                        executable_size=exe,
+                        edge=edge,
+                    )
+                )
+
+        # Direction 2: buy YES on Polymarket + buy NO on Kalshi
+        if p_yes is not None and k_no is not None:
+            cost = p_yes + k_no
+            edge = 1.0 - cost - _fee_buffer(cost, config)
+            exe = min(float(p.orderbook.best_yes_size or 0), float(k.orderbook.best_no_size or 0))
+            if edge >= min_edge and exe >= config.min_executable_size:
+                opps.append(
+                    Opportunity(
+                        question=f"{k.market.market_id} ↔ {p.market.market_id}",
+                        outcomes=("YES", "NO"),
+                        buy_yes_venue=p.market.venue,
+                        buy_yes_price=p_yes,
+                        buy_no_venue=k.market.venue,
+                        buy_no_price=k_no,
+                        sum_price=cost,
+                        executable_size=exe,
+                        edge=edge,
+                    )
+                )
+
+    opps.sort(key=lambda o: o.edge, reverse=True)
+    return opps
+
+
 def format_opportunity_table(opps: list[Opportunity], limit: int = 20) -> str:
     if not opps:
         return "No opportunities found."
@@ -125,12 +188,12 @@ def format_opportunity_table(opps: list[Opportunity], limit: int = 20) -> str:
     lines.append("EDGE | SUM | EXEC | BUY YES (venue@price) | BUY NO (venue@price) | QUESTION")
     lines.append("-" * 110)
     for o in rows:
-        yes_part = f"{o.buy_yes_venue}@{_fmt_float(o.buy_yes_price, 6)}"
-        no_part = f"{o.buy_no_venue}@{_fmt_float(o.buy_no_price, 6)}"
+        yes_part = f"{o.buy_yes_venue}@{o.buy_yes_price:.6f}"
+        no_part = f"{o.buy_no_venue}@{o.buy_no_price:.6f}"
         lines.append(
-            f"{_fmt_float(o.edge, 6):<9} | "
-            f"{_fmt_float(o.sum_price, 6):<7} | "
-            f"{_fmt_float(o.executable_size, 2):<6} | "
+            f"{o.edge:.6f:<9} | "
+            f"{o.sum_price:.6f:<7} | "
+            f"{o.executable_size:.2f:<6} | "
             f"{yes_part:<22} | {no_part:<22} | {o.question}"
         )
     return "\n".join(lines)
@@ -142,15 +205,6 @@ def format_near_miss_pairs_table(
     config: ScannerConfig,
     limit: int = 20,
 ) -> str:
-    """
-    Near-miss ranking.
-
-    - Intra-market (solo Kalshi): por defecto, solo consideramos "binarios normales" cuando
-      yes_ask + no_ask ~ 1.0. En LAB podemos incluir también sumas raras como observabilidad
-      (flag=WEIRD_SUM), pero siguen siendo *no ejecutables* como arbitraje clásico.
-
-    - Cross-venue (A+B): calculamos las dos direcciones y rankeamos por edge (puede ser negativo).
-    """
     rows: list[dict] = []
 
     def _keep(edge: float, exe: float) -> bool:
@@ -191,7 +245,7 @@ def format_near_miss_pairs_table(
                 }
             )
     else:
-        # Cross-venue near-miss
+        # Cross-venue near-miss by question pairing
         for a, b in iter_pairs(snapshots_a, snapshots_b):
             if not a.market.is_binary or not b.market.is_binary:
                 continue
@@ -201,7 +255,6 @@ def format_near_miss_pairs_table(
             b_yes = _normalize_price_to_prob(b.orderbook.best_yes_price)
             b_no = _normalize_price_to_prob(b.orderbook.best_no_price)
 
-            # A yes + B no
             if a_yes is not None and b_no is not None:
                 cost = a_yes + b_no
                 edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -219,7 +272,6 @@ def format_near_miss_pairs_table(
                         }
                     )
 
-            # B yes + A no
             if b_yes is not None and a_no is not None:
                 cost = b_yes + a_no
                 edge = 1.0 - cost - _fee_buffer(cost, config)
@@ -249,11 +301,97 @@ def format_near_miss_pairs_table(
     for r in rows:
         lines.append(
             f"{r['market_id']} | "
-            f"{_fmt_float(r['yes_ask'], 6)} | "
-            f"{_fmt_float(r['no_ask'], 6)} | "
-            f"{_fmt_float(r['sum_price'], 6)} | "
-            f"{_fmt_float(r['edge'], 6)} | "
-            f"{_fmt_float(r['executable_size'], 2)} | "
+            f"{r['yes_ask']:.6f} | "
+            f"{r['no_ask']:.6f} | "
+            f"{r['sum_price']:.6f} | "
+            f"{r['edge']:.6f} | "
+            f"{r['executable_size']:.2f} | "
+            f"{r['flag']}"
+        )
+    return "\n".join(lines)
+
+
+def format_near_miss_pairs_table_from_mapping_pairs(
+    kalshi_snaps: list[MarketSnapshot],
+    poly_snaps: list[MarketSnapshot],
+    mappings: list[MarketMapping],
+    config: ScannerConfig,
+    limit: int = 20,
+) -> str:
+    k_idx = _index_by_market_id(kalshi_snaps)
+    p_idx = _index_by_market_id(poly_snaps)
+
+    rows: list[dict] = []
+
+    def _keep(edge: float, exe: float) -> bool:
+        return edge >= config.near_miss_edge_floor and exe >= config.min_executable_size
+
+    for mp in mappings:
+        k = k_idx.get(mp.kalshi_ticker)
+        p = p_idx.get(mp.polymarket_slug)
+        if not k or not p:
+            continue
+        if not k.market.is_binary or not p.market.is_binary:
+            continue
+
+        k_yes = _normalize_price_to_prob(k.orderbook.best_yes_price)
+        k_no = _normalize_price_to_prob(k.orderbook.best_no_price)
+        p_yes = _normalize_price_to_prob(p.orderbook.best_yes_price)
+        p_no = _normalize_price_to_prob(p.orderbook.best_no_price)
+
+        # k_yes + p_no
+        if k_yes is not None and p_no is not None:
+            cost = k_yes + p_no
+            edge = 1.0 - cost - _fee_buffer(cost, config)
+            exe = min(float(k.orderbook.best_yes_size or 0), float(p.orderbook.best_no_size or 0))
+            if _keep(edge, exe):
+                rows.append(
+                    {
+                        "market_id": f"Kalshi:{k.market.market_id} | Poly:{p.market.market_id}",
+                        "yes_ask": k_yes,
+                        "no_ask": p_no,
+                        "sum_price": cost,
+                        "edge": edge,
+                        "executable_size": exe,
+                        "flag": "OK",
+                    }
+                )
+
+        # p_yes + k_no
+        if p_yes is not None and k_no is not None:
+            cost = p_yes + k_no
+            edge = 1.0 - cost - _fee_buffer(cost, config)
+            exe = min(float(p.orderbook.best_yes_size or 0), float(k.orderbook.best_no_size or 0))
+            if _keep(edge, exe):
+                rows.append(
+                    {
+                        "market_id": f"Poly:{p.market.market_id} | Kalshi:{k.market.market_id}",
+                        "yes_ask": p_yes,
+                        "no_ask": k_no,
+                        "sum_price": cost,
+                        "edge": edge,
+                        "executable_size": exe,
+                        "flag": "OK",
+                    }
+                )
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda r: r["edge"], reverse=True)
+    rows = rows[:limit]
+
+    lines: list[str] = []
+    lines.append("MARKET_ID | YES_ASK | NO_ASK | SUM | EDGE | EXEC | FLAG")
+    lines.append("-" * 120)
+    for r in rows:
+        lines.append(
+            f"{r['market_id']} | "
+            f"{r['yes_ask']:.6f} | "
+            f"{r['no_ask']:.6f} | "
+            f"{r['sum_price']:.6f} | "
+            f"{r['edge']:.6f} | "
+            f"{r['executable_size']:.2f} | "
             f"{r['flag']}"
         )
     return "\n".join(lines)
