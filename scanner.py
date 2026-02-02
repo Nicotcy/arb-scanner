@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from collections import Counter
+from typing import Callable
 
 from arb_scanner.config import apply_mode, load_config
 from arb_scanner.mappings import load_manual_mappings, MarketMapping
@@ -131,55 +132,6 @@ def _looks_like_player_prop(ticker: str) -> bool:
     return any(m in t for m in prop_markers)
 
 
-def _suggestions(tickers, limit_safe: int = 25) -> tuple[list[str], dict]:
-    safe: list[str] = []
-    seen: set[str] = set()
-    stats = Counter()
-
-    for tk in tickers:
-        if not tk or tk in seen:
-            continue
-        seen.add(tk)
-
-        is_sports = _is_any_sports(tk)
-        is_prop = _looks_like_player_prop(tk)
-
-        if is_sports:
-            stats["sports_total"] += 1
-            stats["sports_skipped"] += 1
-            continue
-
-        if is_prop:
-            stats["non_sports_props_skipped"] += 1
-            continue
-
-        stats["safe_total"] += 1
-        if len(safe) < limit_safe:
-            safe.append(tk)
-            stats["safe_kept"] += 1
-
-        if len(safe) >= limit_safe:
-            break
-
-    return safe, dict(stats)
-
-
-def _filter_kalshi_lab_universe(snapshots, universe: str):
-    u = (universe or "").strip().lower()
-    if not u or u == "all":
-        return snapshots
-
-    out = []
-    for s in snapshots:
-        tk = (s.market.market_id or "")
-        if not _is_any_sports(tk):
-            continue
-        if u == "sports_core" and _looks_like_player_prop(tk):
-            continue
-        out.append(s)
-    return out
-
-
 def _resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapping]:
     client = PolymarketPublicClient()
     out: list[MarketMapping] = []
@@ -205,6 +157,18 @@ def _resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapp
         )
 
     return out
+
+
+def _kalshi_lab_predicate(universe: str) -> Callable[[str], bool]:
+    u = (universe or "").strip().lower()
+    if not u or u == "all":
+        return lambda _tk: True
+
+    if u == "sports_props":
+        return lambda tk: _is_any_sports(tk)
+
+    # sports_core
+    return lambda tk: _is_any_sports(tk) and (not _looks_like_player_prop(tk))
 
 
 def main() -> int:
@@ -249,39 +213,39 @@ def main() -> int:
     snapshots_b = []
     resolved_mappings: list[MarketMapping] | None = None
 
+    # Decide Kalshi prefilter BEFORE fetching snapshots
+    kalshi_include: set[str] | None = None
+    kalshi_predicate: Callable[[str], bool] | None = None
+
+    if args.use_mapping or args.use_mapping_stub:
+        mappings = load_manual_mappings()
+        if not mappings:
+            print(summarize_config(config))
+            print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
+            return 0
+        kalshi_include = {m.kalshi_ticker for m in mappings if m.kalshi_ticker}
+        # resolved_mappings is assigned below per branch (stub vs real)
+    elif args.use_kalshi and config.mode == "lab":
+        kalshi_predicate = _kalshi_lab_predicate(lab_universe)
+
     if args.use_stub:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
         snapshots_a = list(provider_a.fetch_market_snapshots())
         snapshots_b = list(provider_b.fetch_market_snapshots())
     else:
-        provider_a = KalshiProvider()
+        provider_a = KalshiProvider(ticker_filter=kalshi_predicate, include_tickers=kalshi_include)
         snapshots_a = list(provider_a.fetch_market_snapshots())
-
-        if args.use_kalshi and config.mode == "lab":
-            before = len(snapshots_a)
-            snapshots_a = _filter_kalshi_lab_universe(snapshots_a, lab_universe)
-            after = len(snapshots_a)
-            if lab_universe != "all":
-                print(f"LAB universe filter={lab_universe} kept={after}/{before}")
 
         if args.use_kalshi:
             snapshots_b = []
         elif args.use_mapping_stub:
             mappings = load_manual_mappings()
-            if not mappings:
-                print(summarize_config(config))
-                print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
-                return 0
             resolved_mappings = mappings
             provider_b = PolymarketStubProvider()
             snapshots_b = list(provider_b.fetch_market_snapshots())
         elif args.use_mapping:
             mappings = load_manual_mappings()
-            if not mappings:
-                print(summarize_config(config))
-                print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
-                return 0
 
             resolved = _resolve_polymarket_tokens(mappings)
             unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
