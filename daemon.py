@@ -268,3 +268,69 @@ def main() -> int:
             index_p = {s.market.market_id: s for s in snaps_p}  # PolymarketProvider probably sets market_id=slug
 
             for mp in resolved_mappings:
+                ks = index_k.get(mp.kalshi_ticker)
+                ps = index_p.get(mp.polymarket_slug) or index_p.get(f"Poly:{mp.polymarket_slug}")
+                if not ks or not ps:
+                    continue
+
+                # Direction 1: buy YES on Kalshi, buy NO on Poly
+                k_yes = ks.orderbook.best_yes_price
+                p_no = ps.orderbook.best_no_price
+                if k_yes is not None and p_no is not None:
+                    cost = float(k_yes) + float(p_no)
+                    raw_edge = 1.0 - cost
+                    buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
+                    exe = min(float(ks.orderbook.best_yes_size or 0.0), float(ps.orderbook.best_no_size or 0.0))
+                    if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+                        store.insert_signal(
+                            ts=ts,
+                            kind="cross_venue",
+                            a_venue="Kalshi",
+                            a_market_id=mp.kalshi_ticker,
+                            b_venue="Polymarket",
+                            b_market_id=mp.polymarket_slug,
+                            sum_price=cost,
+                            raw_edge=raw_edge,
+                            buf_edge=buf_edge,
+                            exec_size=exe,
+                            details="BUY yes@kalshi + no@poly",
+                        )
+                        print(
+                            f"[ALERT] cross_venue {mp.kalshi_ticker} <-> {mp.polymarket_slug} "
+                            f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                        )
+
+                # Direction 2: buy YES on Poly, buy NO on Kalshi
+                p_yes = ps.orderbook.best_yes_price
+                k_no = ks.orderbook.best_no_price
+                if p_yes is not None and k_no is not None:
+                    cost = float(p_yes) + float(k_no)
+                    raw_edge = 1.0 - cost
+                    buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
+                    exe = min(float(ps.orderbook.best_yes_size or 0.0), float(ks.orderbook.best_no_size or 0.0))
+                    if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+                        store.insert_signal(
+                            ts=ts,
+                            kind="cross_venue",
+                            a_venue="Polymarket",
+                            a_market_id=mp.polymarket_slug,
+                            b_venue="Kalshi",
+                            b_market_id=mp.kalshi_ticker,
+                            sum_price=cost,
+                            raw_edge=raw_edge,
+                            buf_edge=buf_edge,
+                            exec_size=exe,
+                            details="BUY yes@poly + no@kalshi",
+                        )
+                        print(
+                            f"[ALERT] cross_venue {mp.polymarket_slug} <-> {mp.kalshi_ticker} "
+                            f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                        )
+
+            print(f"[daemon] mapping tickers={len(resolved_mappings)}")
+
+        time.sleep(args.sleep_secs)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
