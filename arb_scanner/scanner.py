@@ -62,7 +62,8 @@ def compute_opportunities(
 
         if a_yes is not None and b_no is not None:
             cost = a_yes + b_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(a.orderbook.best_yes_size or 0), float(b.orderbook.best_no_size or 0))
             if edge >= min_edge and exe >= config.min_executable_size:
                 opps.append(
@@ -81,7 +82,8 @@ def compute_opportunities(
 
         if b_yes is not None and a_no is not None:
             cost = b_yes + a_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(b.orderbook.best_yes_size or 0), float(a.orderbook.best_no_size or 0))
             if edge >= min_edge and exe >= config.min_executable_size:
                 opps.append(
@@ -133,7 +135,8 @@ def compute_opportunities_from_mapping_pairs(
 
         if k_yes is not None and p_no is not None:
             cost = k_yes + p_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(k.orderbook.best_yes_size or 0), float(p.orderbook.best_no_size or 0))
             if edge >= min_edge and exe >= config.min_executable_size:
                 opps.append(
@@ -152,7 +155,8 @@ def compute_opportunities_from_mapping_pairs(
 
         if p_yes is not None and k_no is not None:
             cost = p_yes + k_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(p.orderbook.best_yes_size or 0), float(k.orderbook.best_no_size or 0))
             if edge >= min_edge and exe >= config.min_executable_size:
                 opps.append(
@@ -197,9 +201,16 @@ def format_tightest_markets_table(
     snapshots: list[MarketSnapshot],
     config: ScannerConfig,
     limit: int = 20,
+    min_exec_size: float | None = None,
 ) -> str:
-    """Internal (single-venue) view: show markets closest to being hedgeable (highest edge), even if negative."""
+    """
+    Internal (single-venue) view: show markets closest to being hedgeable.
+
+    - RAW_EDGE: ignores fee buffer (pure book tightness).
+    - BUF_EDGE: subtracts fee buffer (what you'd treat as "net" after buffer).
+    """
     rows: list[dict] = []
+    min_exec = float(min_exec_size) if (min_exec_size is not None) else float(config.min_executable_size)
 
     for s in snapshots:
         if not s.market.is_binary:
@@ -211,9 +222,10 @@ def format_tightest_markets_table(
             continue
 
         cost = y + n
-        edge = 1.0 - cost - _fee_buffer(cost, config)
+        raw_edge = 1.0 - cost
+        buf_edge = raw_edge - _fee_buffer(cost, config)
         exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
-        if exe < config.min_executable_size:
+        if exe < min_exec:
             continue
 
         normal_like = 0.90 <= cost <= 1.10
@@ -226,7 +238,8 @@ def format_tightest_markets_table(
                 "yes_ask": y,
                 "no_ask": n,
                 "sum_price": cost,
-                "edge": edge,
+                "raw_edge": raw_edge,
+                "buf_edge": buf_edge,
                 "executable_size": exe,
                 "flag": "OK" if normal_like else "WEIRD_SUM",
             }
@@ -235,19 +248,21 @@ def format_tightest_markets_table(
     if not rows:
         return ""
 
-    rows.sort(key=lambda r: r["edge"], reverse=True)
+    # Sort by raw tightness first (what you want to observe), then by size
+    rows.sort(key=lambda r: (r["raw_edge"], r["executable_size"]), reverse=True)
     rows = rows[:limit]
 
     lines: list[str] = []
-    lines.append("MARKET_ID | YES_ASK | NO_ASK | SUM | EDGE | EXEC | FLAG")
-    lines.append("-" * 120)
+    lines.append("MARKET_ID | YES_ASK | NO_ASK | SUM | RAW_EDGE | BUF_EDGE | EXEC | FLAG")
+    lines.append("-" * 140)
     for r in rows:
         lines.append(
             f"{r['market_id']} | "
             f"{r['yes_ask']:.6f} | "
             f"{r['no_ask']:.6f} | "
             f"{r['sum_price']:.6f} | "
-            f"{r['edge']:.6f} | "
+            f"{r['raw_edge']:.6f} | "
+            f"{r['buf_edge']:.6f} | "
             f"{r['executable_size']:.2f} | "
             f"{r['flag']}"
         )
@@ -280,7 +295,8 @@ def format_near_miss_pairs_table(
                 continue
 
             cost = y + n
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(s.orderbook.best_yes_size or 0), float(s.orderbook.best_no_size or 0))
 
             normal_like = 0.90 <= cost <= 1.10
@@ -314,7 +330,8 @@ def format_near_miss_pairs_table(
 
             if a_yes is not None and b_no is not None:
                 cost = a_yes + b_no
-                edge = 1.0 - cost - _fee_buffer(cost, config)
+                raw_edge = 1.0 - cost
+                edge = raw_edge - _fee_buffer(cost, config)
                 exe = min(float(a.orderbook.best_yes_size or 0), float(b.orderbook.best_no_size or 0))
                 if _keep(edge, exe):
                     rows.append(
@@ -331,7 +348,8 @@ def format_near_miss_pairs_table(
 
             if b_yes is not None and a_no is not None:
                 cost = b_yes + a_no
-                edge = 1.0 - cost - _fee_buffer(cost, config)
+                raw_edge = 1.0 - cost
+                edge = raw_edge - _fee_buffer(cost, config)
                 exe = min(float(b.orderbook.best_yes_size or 0), float(a.orderbook.best_no_size or 0))
                 if _keep(edge, exe):
                     rows.append(
@@ -402,7 +420,8 @@ def format_near_miss_pairs_table_from_mapping_pairs(
 
         if k_yes is not None and p_no is not None:
             cost = k_yes + p_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(k.orderbook.best_yes_size or 0), float(p.orderbook.best_no_size or 0))
             if _keep(edge, exe):
                 rows.append(
@@ -419,7 +438,8 @@ def format_near_miss_pairs_table_from_mapping_pairs(
 
         if p_yes is not None and k_no is not None:
             cost = p_yes + k_no
-            edge = 1.0 - cost - _fee_buffer(cost, config)
+            raw_edge = 1.0 - cost
+            edge = raw_edge - _fee_buffer(cost, config)
             exe = min(float(p.orderbook.best_yes_size or 0), float(k.orderbook.best_no_size or 0))
             if _keep(edge, exe):
                 rows.append(
