@@ -29,13 +29,13 @@ class OrderBookSummary:
 class PolymarketPublicClient:
     """
     Read-only client for:
-    - CLOB orderbook: GET /book?token_id=...
-    - Gamma markets metadata: GET /markets?slug=...
+      - Gamma: market metadata (slug -> market details including clobTokenIds)
+      - CLOB: orderbook (token_id -> bids/asks)
 
-    IMPORTANT: On some Mac/Python setups, default SSL cert store is missing,
-    causing CERTIFICATE_VERIFY_FAILED. We fix it by using certifi if installed.
-    As a last resort (dev only), you can set:
-        POLYMARKET_INSECURE_SSL=1
+    Notes:
+      - Some environments hit SSL issues (CERTIFICATE_VERIFY_FAILED). We use certifi if installed.
+      - Some environments hit 403 on Gamma without "browser-like" headers. We add them.
+      - Gamma has a dedicated endpoint: GET /markets/slug/{slug} (preferred). :contentReference[oaicite:1]{index=1}
     """
 
     def __init__(self, timeout_s: float = 15.0, retry_429: int = 3) -> None:
@@ -43,40 +43,51 @@ class PolymarketPublicClient:
         self.retry_429 = retry_429
 
     def _ssl_context(self) -> ssl.SSLContext:
-        # DEV escape hatch (do not use for real trading):
         if os.getenv("POLYMARKET_INSECURE_SSL", "0") == "1":
             return ssl._create_unverified_context()
 
-        # Best: use certifi CA bundle if available
         try:
             import certifi  # type: ignore
 
-            cafile = certifi.where()
-            return ssl.create_default_context(cafile=cafile)
+            return ssl.create_default_context(cafile=certifi.where())
         except Exception:
-            # Fallback: system default context (may fail on some Macs)
             return ssl.create_default_context()
+
+    def _default_headers(self) -> dict[str, str]:
+        # "Normal" browser-ish headers help avoid 403 from basic WAF rules
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://polymarket.com/",
+            "Origin": "https://polymarket.com",
+        }
 
     def _get_json(self, url: str) -> Any:
         last_err: Exception | None = None
         ctx = self._ssl_context()
+        headers = self._default_headers()
 
         for attempt in range(self.retry_429 + 1):
             try:
-                req = urllib.request.Request(url, method="GET")
+                req = urllib.request.Request(url, method="GET", headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout_s, context=ctx) as resp:
                     status = getattr(resp, "status", 200)
                     body = resp.read().decode("utf-8")
 
                 if status == 429:
-                    time.sleep(0.5 * (attempt + 1))
+                    time.sleep(0.6 * (attempt + 1))
                     continue
 
                 return json.loads(body)
 
             except Exception as e:
                 last_err = e
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.25 * (attempt + 1))
 
         raise RuntimeError(f"GET failed: {url} err={last_err}")
 
@@ -99,14 +110,6 @@ class PolymarketPublicClient:
 
         return OrderBookSummary(token_id=token_id, best_bid=best_bid, best_ask=best_ask)
 
-    def gamma_get_markets_by_slug(self, slug: str) -> list[dict]:
-        q = urllib.parse.urlencode({"slug": slug})
-        url = f"{GAMMA_HOST}/markets?{q}"
-        data = self._get_json(url)
-        if isinstance(data, list):
-            return data
-        return []
-
     @staticmethod
     def _parse_clob_token_ids(value: Any) -> list[str]:
         if value is None:
@@ -126,16 +129,23 @@ class PolymarketPublicClient:
             return [s]
         return []
 
+    def gamma_get_market_by_slug(self, slug: str) -> dict | None:
+        # Preferred documented endpoint: /markets/slug/{slug} :contentReference[oaicite:2]{index=2}
+        slug_enc = urllib.parse.quote(slug, safe="")
+        url = f"{GAMMA_HOST}/markets/slug/{slug_enc}"
+        data = self._get_json(url)
+        if isinstance(data, dict) and data.get("slug"):
+            return data
+        return None
+
     def resolve_slug_to_yes_no_token_ids(self, slug: str) -> tuple[str, str] | None:
-        markets = self.gamma_get_markets_by_slug(slug)
-        if not markets:
+        m = self.gamma_get_market_by_slug(slug)
+        if not m:
             return None
 
-        m = markets[0]
         token_ids = self._parse_clob_token_ids(m.get("clobTokenIds"))
-
         if len(token_ids) < 2:
             return None
 
-        # Convention: [YES, NO]
+        # Convention is typically [YES, NO] for binary markets.
         return (token_ids[0], token_ids[1])
