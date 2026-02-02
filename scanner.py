@@ -32,6 +32,17 @@ def parse_args() -> argparse.Namespace:
         help="Policy mode: lab (more observability) vs safe (stricter thresholds/liq).",
     )
 
+    parser.add_argument(
+        "--lab-universe",
+        choices=["sports_core", "sports_props", "all"],
+        default="",
+        help=(
+            "LAB only: choose which Kalshi markets to include for observability. "
+            "sports_core = game/spread/total/futures (excludes most player props); "
+            "sports_props = includes props too; all = no filtering."
+        ),
+    )
+
     parser.add_argument("--use-stub", action="store_true", help="Use stub providers.")
     parser.add_argument("--use-kalshi", action="store_true", help="Use Kalshi read-only snapshots.")
     parser.add_argument(
@@ -143,6 +154,22 @@ def _suggestions(tickers, limit_safe: int = 25) -> tuple[list[str], dict]:
     return safe, dict(stats)
 
 
+def _filter_kalshi_lab_universe(snapshots, universe: str):
+    u = (universe or "").strip().lower()
+    if not u or u == "all":
+        return snapshots
+
+    out = []
+    for s in snapshots:
+        tk = (s.market.market_id or "")
+        if not _is_any_sports(tk):
+            continue
+        if u == "sports_core" and _looks_like_player_prop(tk):
+            continue
+        out.append(s)
+    return out
+
+
 def _resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapping]:
     client = PolymarketPublicClient()
     out: list[MarketMapping] = []
@@ -175,6 +202,11 @@ def main() -> int:
 
     config = load_config()
     config = apply_mode(config, args.mode)
+
+    lab_universe = (args.lab_universe or "").strip().lower()
+    if not lab_universe and config.mode == "lab":
+        # Default: conservative LAB (no props by default)
+        lab_universe = "sports_core"
 
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
@@ -216,6 +248,13 @@ def main() -> int:
         provider_a = KalshiProvider()
         snapshots_a = list(provider_a.fetch_market_snapshots())
 
+        if args.use_kalshi and config.mode == "lab":
+            before = len(snapshots_a)
+            snapshots_a = _filter_kalshi_lab_universe(snapshots_a, lab_universe)
+            after = len(snapshots_a)
+            if lab_universe != "all":
+                print(f"LAB universe filter={lab_universe} kept={after}/{before}")
+
         if args.use_kalshi:
             snapshots_b = []
         elif args.use_mapping_stub:
@@ -250,7 +289,10 @@ def main() -> int:
         else:
             raise SystemExit("Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, or --use-stub")
 
-    print(summarize_config(config))
+    print(
+        summarize_config(config)
+        + (f" lab_universe={lab_universe}" if config.mode == "lab" and args.use_kalshi else "")
+    )
 
     opportunities = []
     if snapshots_b:
@@ -276,6 +318,15 @@ def main() -> int:
         print(near_miss_pairs)
     else:
         print("No valid binary markets for near-miss table.")
+
+    # LAB-only: always print tightest internal markets for Kalshi-only runs
+    if args.use_kalshi and config.mode == "lab":
+        from arb_scanner.scanner import format_tightest_markets_table
+
+        tight = format_tightest_markets_table(snapshots_a, config, limit=20)
+        if tight:
+            print("Tightest internal Kalshi markets (top 20):")
+            print(tight)
 
     return 0
 
