@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from collections import Counter
-from dataclasses import replace
 
 from arb_scanner.config import apply_mode, load_config
 from arb_scanner.mappings import load_manual_mappings, MarketMapping
@@ -44,15 +44,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use manual mappings but Polymarket STUB (debug only).",
     )
+
     parser.add_argument(
-        "--kalshi-market-prices",
-        action="store_true",
-        help="Print sample Kalshi market prices using expanded leg tickers + top-of-book.",
-    )
-    parser.add_argument(
-        "--suggest-safe",
-        action="store_true",
-        help="Print ONLY 'safer' Kalshi candidates (non-sports by strict rules).",
+        "--debug-kalshi-orderbook",
+        type=str,
+        default="",
+        help="Print raw Kalshi orderbook JSON for a specific ticker and exit.",
     )
 
     return parser.parse_args()
@@ -157,6 +154,15 @@ def main() -> int:
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
 
+    # Debug raw Kalshi orderbook JSON for one ticker
+    if args.debug_kalshi_orderbook:
+        from arb_scanner.kalshi_public import KalshiPublicClient
+
+        client = KalshiPublicClient()
+        payload = client.get_orderbook(args.debug_kalshi_orderbook.strip())
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
     snapshots_a = []
     snapshots_b = []
     resolved_mappings: list[MarketMapping] | None = None
@@ -166,78 +172,12 @@ def main() -> int:
         provider_b = StubProvider("Polymarket")
         snapshots_a = list(provider_a.fetch_market_snapshots())
         snapshots_b = list(provider_b.fetch_market_snapshots())
-
-    elif args.kalshi_market_prices:
-        from arb_scanner.kalshi_public import KalshiPublicClient
-
-        client = KalshiPublicClient()
-
-        max_pages = int(os.getenv("KALSHI_PAGES", "3"))
-        limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
-
-        tickers_to_price: list[str] = []
-        seen: set[str] = set()
-
-        for market in client.list_open_markets(max_pages=max_pages, limit_per_page=limit_per_page):
-            t = market.get("ticker")
-            if not t:
-                continue
-
-            legs = market.get("mve_selected_legs") or []
-            if legs:
-                for leg in legs:
-                    lt = leg.get("market_ticker")
-                    if lt and lt not in seen:
-                        tickers_to_price.append(lt)
-                        seen.add(lt)
-            else:
-                if t not in seen:
-                    tickers_to_price.append(t)
-                    seen.add(t)
-
-        printed = 0
-        for ticker in tickers_to_price:
-            if printed >= 50:
-                break
-            try:
-                top = client.fetch_top_of_book(ticker)
-            except Exception:
-                continue
-            if top.yes_ask is None or top.no_ask is None:
-                continue
-
-            yes_ask_prob = top.yes_ask / 100.0
-            no_ask_prob = top.no_ask / 100.0
-            spread_sum = yes_ask_prob + no_ask_prob
-
-            print(f"{ticker}")
-            print(f"  yes_ask={yes_ask_prob}")
-            print(f"  no_ask={no_ask_prob}")
-            print(f"  spread_sum={spread_sum}")
-            printed += 1
-
-        return 0
-
     else:
         provider_a = KalshiProvider()
         snapshots_a = list(provider_a.fetch_market_snapshots())
 
-        if args.suggest_safe:
-            safe, stats = _suggestions([s.market.market_id for s in snapshots_a])
-            print(summarize_config(config))
-            print("Suggestion stats:", stats)
-            if safe:
-                print("\nSAFE candidates (strict non-sports, top 25):")
-                for tk in safe:
-                    print(f"  - {tk}")
-            else:
-                print("\nSAFE candidates: NONE found in this sample.")
-                print("Meaning: current open Kalshi markets are basically sports.")
-            return 0
-
         if args.use_kalshi:
             snapshots_b = []
-
         elif args.use_mapping_stub:
             mappings = load_manual_mappings()
             if not mappings:
@@ -247,7 +187,6 @@ def main() -> int:
             resolved_mappings = mappings
             provider_b = PolymarketStubProvider()
             snapshots_b = list(provider_b.fetch_market_snapshots())
-
         elif args.use_mapping:
             mappings = load_manual_mappings()
             if not mappings:
@@ -268,17 +207,13 @@ def main() -> int:
             resolved_mappings = resolved
             provider_b = PolymarketProvider(mappings=resolved)
             snapshots_b = list(provider_b.fetch_market_snapshots())
-
         else:
-            raise SystemExit(
-                "Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, --suggest-safe, or --kalshi-market-prices"
-            )
+            raise SystemExit("Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, or --use-stub")
 
     print(summarize_config(config))
 
     opportunities = []
     if snapshots_b:
-        # When mappings exist, pair explicitly by mapping (NOT by question text).
         if resolved_mappings:
             opportunities = compute_opportunities_from_mapping_pairs(snapshots_a, snapshots_b, resolved_mappings, config)
         else:
