@@ -30,6 +30,7 @@ class ScannerConfig:
 
     # Near-miss filtering / observability
     near_miss_edge_floor: float
+    near_miss_edge_ceiling: float | None
     near_miss_include_weird_sums: bool
 
     # Costs / friction
@@ -52,6 +53,7 @@ def _mode_defaults(mode: str) -> dict:
             "min_edge_opportunity": float(os.getenv("SAFE_MIN_EDGE", "0.015")),
             "min_executable_size": float(os.getenv("SAFE_MIN_EXEC_SIZE", "10")),
             "near_miss_edge_floor": float(os.getenv("SAFE_NEAR_MISS_FLOOR", "-0.005")),
+            "near_miss_edge_ceiling": float(os.getenv("SAFE_NEAR_MISS_CEILING", "0.02")),
             "near_miss_include_weird_sums": False,  # SAFE: no “weird” observability
         }
 
@@ -59,7 +61,9 @@ def _mode_defaults(mode: str) -> dict:
         "mode": "lab",
         "min_edge_opportunity": float(os.getenv("LAB_MIN_EDGE", "0.0")),
         "min_executable_size": float(os.getenv("LAB_MIN_EXEC_SIZE", "1")),
-        "near_miss_edge_floor": float(os.getenv("LAB_NEAR_MISS_FLOOR", "-0.05")),
+        # LAB: we want "almost" not "normal spread all day"
+        "near_miss_edge_floor": float(os.getenv("LAB_NEAR_MISS_FLOOR", "-0.01")),
+        "near_miss_edge_ceiling": float(os.getenv("LAB_NEAR_MISS_CEILING", "0.02")),
         "near_miss_include_weird_sums": _env_flag("LAB_INCLUDE_WEIRD_SUMS", "1"),
     }
 
@@ -73,6 +77,7 @@ def apply_mode(config: ScannerConfig, mode: str) -> ScannerConfig:
         min_edge_opportunity=md["min_edge_opportunity"],
         min_executable_size=md["min_executable_size"],
         near_miss_edge_floor=md["near_miss_edge_floor"],
+        near_miss_edge_ceiling=md["near_miss_edge_ceiling"],
         near_miss_include_weird_sums=md["near_miss_include_weird_sums"],
     )
 
@@ -97,6 +102,7 @@ def load_config() -> ScannerConfig:
         min_edge_opportunity=md["min_edge_opportunity"],
         min_executable_size=md["min_executable_size"],
         near_miss_edge_floor=md["near_miss_edge_floor"],
+        near_miss_edge_ceiling=md["near_miss_edge_ceiling"],
         near_miss_include_weird_sums=md["near_miss_include_weird_sums"],
         fee_buffer_bps=fee_buffer_bps,
     )
