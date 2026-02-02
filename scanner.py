@@ -4,19 +4,16 @@ import argparse
 import os
 
 from arb_scanner.config import load_config
-from arb_scanner.sources.kalshi import KalshiProvider
-from arb_scanner.sources.stub import StubProvider
 from arb_scanner.mappings import load_manual_mappings
-from arb_scanner.sources.polymarket_stub import PolymarketStubProvider
-
-
-# Importamos TODO lo que vamos a usar del módulo core
 from arb_scanner.scanner import (
     compute_opportunities,
     format_near_miss_pairs_table,
     format_opportunity_table,
     summarize_config,
 )
+from arb_scanner.sources.kalshi import KalshiProvider
+from arb_scanner.sources.polymarket_stub import PolymarketStubProvider
+from arb_scanner.sources.stub import StubProvider
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,7 +26,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use manual Kalshi<->Polymarket mappings (Polymarket stub for now).",
     )
-
     parser.add_argument(
         "--kalshi-market-prices",
         action="store_true",
@@ -47,12 +43,16 @@ def main() -> int:
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
 
+    snapshots_a = []
+    snapshots_b = []
+
     if args.use_stub:
         provider_a = StubProvider("Kalshi")
         provider_b = StubProvider("Polymarket")
         snapshots_a = list(provider_a.fetch_market_snapshots())
         snapshots_b = list(provider_b.fetch_market_snapshots())
-        elif args.use_mapping:
+
+    elif args.use_mapping:
         # 1) Kalshi snapshots
         provider_a = KalshiProvider()
         snapshots_a = list(provider_a.fetch_market_snapshots())
@@ -61,12 +61,16 @@ def main() -> int:
         provider_b = PolymarketStubProvider()
         snapshots_b = list(provider_b.fetch_market_snapshots())
 
-        # 3) Mappings manuales
+        # 3) Mappings manuales (todavía no los usamos para fetch real porque Polymarket es stub)
         mappings = load_manual_mappings()
         if not mappings:
             print(summarize_config(config))
             print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
             return 0
+
+        print(summarize_config(config))
+        print(f"Loaded {len(mappings)} manual mappings. (Polymarket is stub for now)")
+        # Seguimos para imprimir near-miss de Kalshi (y luego cross cuando Polymarket sea real)
 
     elif args.kalshi_market_prices:
         from arb_scanner.kalshi_public import KalshiPublicClient
@@ -125,14 +129,13 @@ def main() -> int:
         snapshots_b = []  # todavía no metemos Polymarket aquí
 
     else:
-        raise SystemExit("Choose one: --use-stub, --use-kalshi, or --kalshi-market-prices")
+        raise SystemExit("Choose one: --use-stub, --use-kalshi, --use-mapping, or --kalshi-market-prices")
 
     # Oportunidades (si hay dos venues); si no, lista vacía
     opportunities = []
     if snapshots_b:
         opportunities = compute_opportunities(snapshots_a, snapshots_b, config)
 
-    # Output base
     print(summarize_config(config))
 
     if opportunities:
@@ -140,7 +143,6 @@ def main() -> int:
     else:
         print("No opportunities found.")
 
-    # Near-miss: se puede imprimir aunque solo haya Kalshi (si la función está implementada así)
     near_miss_pairs = format_near_miss_pairs_table(snapshots_a, snapshots_b, config)
     if near_miss_pairs:
         print("Near-miss opportunities (top 20):")
