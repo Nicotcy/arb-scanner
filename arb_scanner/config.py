@@ -1,16 +1,15 @@
 """Configuration defaults for arb-scanner.
 
-This project is intentionally conservative:
 - DRY_RUN stays on.
 - Mode changes policy (thresholds + observability), not architecture.
 
-Env vars are optional overrides. CLI --mode should override env MODE.
+Env vars are optional overrides. CLI --mode overrides env MODE.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -48,16 +47,14 @@ def _mode_defaults(mode: str) -> dict:
         m = "lab"
 
     if m == "safe":
-        # SAFE: higher edge requirement + higher liquidity requirement + no "weird" observability.
         return {
             "mode": "safe",
             "min_edge_opportunity": float(os.getenv("SAFE_MIN_EDGE", "0.015")),
             "min_executable_size": float(os.getenv("SAFE_MIN_EXEC_SIZE", "10")),
             "near_miss_edge_floor": float(os.getenv("SAFE_NEAR_MISS_FLOOR", "-0.005")),
-            "near_miss_include_weird_sums": False,
+            "near_miss_include_weird_sums": False,  # SAFE: no “weird” observability
         }
 
-    # LAB: be more permissive + show weird sums for debugging/learning.
     return {
         "mode": "lab",
         "min_edge_opportunity": float(os.getenv("LAB_MIN_EDGE", "0.0")),
@@ -67,16 +64,26 @@ def _mode_defaults(mode: str) -> dict:
     }
 
 
+def apply_mode(config: ScannerConfig, mode: str) -> ScannerConfig:
+    """Return a new config with mode-dependent defaults applied."""
+    md = _mode_defaults(mode)
+    return replace(
+        config,
+        mode=md["mode"],
+        min_edge_opportunity=md["min_edge_opportunity"],
+        min_executable_size=md["min_executable_size"],
+        near_miss_edge_floor=md["near_miss_edge_floor"],
+        near_miss_include_weird_sums=md["near_miss_include_weird_sums"],
+    )
+
+
 def load_config() -> ScannerConfig:
     """Load configuration from environment with safe defaults."""
-
     dry_run = _env_flag("DRY_RUN", "1")
 
-    # Mode comes from env by default, but CLI should override it later.
     env_mode = os.getenv("MODE", "lab")
     md = _mode_defaults(env_mode)
 
-    # Legacy alert knobs (still respected).
     alert_only = _env_flag("ALERT_ONLY", "0")
     alert_threshold = float(os.getenv("ALERT_THRESHOLD", "0.02"))
 
