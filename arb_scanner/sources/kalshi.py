@@ -20,38 +20,37 @@ class KalshiStats:
 
 
 class KalshiProvider:
+    """
+    Read-only provider using Kalshi public trade-api.
+
+    IMPORTANT:
+    Kalshi /markets/{ticker}/orderbook returns bids only.
+    Our KalshiPublicClient.fetch_top_of_book derives asks by complementarity.
+    We treat derived asks as "buyable" top-of-book for scanner purposes.
+    """
+
     def __init__(self) -> None:
         self.client = KalshiPublicClient()
 
-        # keep existing knobs if you already have them in env
         self.max_pages = int(os.getenv("KALSHI_PAGES", "3"))
         self.limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
 
-        # liquidity filters (if you had them already)
-        self.min_liquidity = float(os.getenv("KALSHI_MIN_LIQ", "0"))
-        self.require_two_sided = os.getenv("KALSHI_REQUIRE_TWO_SIDED", "1") in {"1", "true", "yes", "on"}
+        # Liquidity filters (very light)
+        self.min_exec_size = float(os.getenv("KALSHI_MIN_EXEC_SIZE", "1"))
 
-        # blacklist behavior from your existing code
+        # If you had blacklist logic previously, keep env knobs
         self.blacklist_max_filtered_ratio = float(os.getenv("KALSHI_BLACKLIST_MAX_FILTERED_RATIO", "0.95"))
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         stats = KalshiStats()
 
-        raw_markets = list(self.client.list_open_markets(max_pages=self.max_pages, limit_per_page=self.limit_per_page))
-        stats.total = len(raw_markets) if raw_markets else 0
+        markets = list(self.client.list_open_markets(max_pages=self.max_pages, limit_per_page=self.limit_per_page))
+        stats.total = len(markets)
 
-        # Your project had blacklist logic; keep it lightweight:
-        # If blacklist filters almost everything, fall back to raw.
-        filtered = self._apply_blacklist(raw_markets)
-        if raw_markets:
-            filtered_ratio = 1.0 - (len(filtered) / max(len(raw_markets), 1))
-            if filtered_ratio > self.blacklist_max_filtered_ratio:
-                print(
-                    f"KalshiProvider: blacklist too aggressive (filtered={len(raw_markets)-len(filtered)} raw={len(raw_markets)}); using raw"
-                )
-                filtered = raw_markets
+        # If later you reintroduce blacklist, do it here.
+        used = markets
 
-        for m in filtered:
+        for m in used:
             ticker = m.get("ticker")
             if not ticker:
                 continue
@@ -62,16 +61,20 @@ class KalshiProvider:
                 stats.errors += 1
                 continue
 
-            # We cannot trust top-of-book yet (bid/ask unknown). Until fixed, treat as no prices.
+            # We require derived asks to exist to consider it tradeable.
             if top.yes_ask is None or top.no_ask is None:
                 stats.noprices += 1
                 continue
 
-            # If later you fix bid/ask, this will start working again.
-            yes_ask = top.yes_ask
-            no_ask = top.no_ask
-            yes_sz = float(top.yes_ask_qty or 0)
-            no_sz = float(top.no_ask_qty or 0)
+            yes_ask = float(top.yes_ask)
+            no_ask = float(top.no_ask)
+            yes_sz = float(top.yes_ask_qty or 0.0)
+            no_sz = float(top.no_ask_qty or 0.0)
+
+            # Minimal executability filter (optional)
+            if yes_sz < self.min_exec_size or no_sz < self.min_exec_size:
+                stats.liqskip += 1
+                continue
 
             ob = OrderBookTop(
                 best_yes_price=yes_ask,
@@ -80,6 +83,7 @@ class KalshiProvider:
                 best_no_size=no_sz,
             )
 
+            # Heuristic: these are binary markets (YES/NO)
             market = Market(
                 venue="Kalshi",
                 market_id=ticker,
@@ -87,12 +91,7 @@ class KalshiProvider:
                 outcomes=("YES", "NO"),
             )
 
-            # two-sided check (later will work when bids exist)
-            if self.require_two_sided:
-                if ob.best_yes_price is None or ob.best_no_price is None:
-                    stats.one_sided += 1
-                    continue
-
+            # Two-sided (asks exist for both)
             stats.ok += 1
             stats.two_sided += 1
             yield MarketSnapshot(market=market, orderbook=ob)
@@ -103,9 +102,3 @@ class KalshiProvider:
             f"noprices={stats.noprices} liqskip={stats.liqskip} "
             f"one_sided={stats.one_sided} two_sided={stats.two_sided}"
         )
-
-    def _apply_blacklist(self, markets: list[dict]) -> list[dict]:
-        # Minimal placeholder: if you already have a richer blacklist, keep yours.
-        # This keeps behavior stable.
-        return markets
-
