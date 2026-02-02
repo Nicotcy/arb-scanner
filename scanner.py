@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from typing import Iterable
 
 from arb_scanner.config import load_config
 from arb_scanner.mappings import load_manual_mappings
@@ -35,6 +36,80 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _looks_like_sports_ticker(ticker: str) -> bool:
+    """
+    Heurística rápida: excluir deportes/props, porque NO sirven para mappings 'seguros'.
+    No es perfecto, pero reduce muchísimo ruido.
+    """
+    t = ticker.upper()
+
+    sports_prefixes = (
+        "KXNBA",
+        "KXNFL",
+        "KXNCA",
+        "KXMLB",
+        "KXNHL",
+        "KXWNBA",
+        "KXUFC",
+        "KXSOCCER",
+        "KXCFB",
+        "KXNCAA",
+    )
+    if t.startswith(sports_prefixes):
+        return True
+
+    sports_markers = (
+        "PTS",
+        "REB",
+        "AST",
+        "STL",
+        "BLK",
+        "SPREAD",
+        "TOTAL",
+        "GAME",
+        "RSH",
+        "PASS",
+        "REC",
+        "TD",
+        "YDS",
+        "3PT",
+        "GOALS",
+        "SACK",
+        "INT",
+    )
+    if any(m in t for m in sports_markers):
+        return True
+
+    # Muchos deportes llevan fecha tipo -26JAN31 / -26FEB08 etc
+    month_markers = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    if any(m in t for m in month_markers) and any(ch.isdigit() for ch in t):
+        return True
+
+    return False
+
+
+def _suggest_kalshi_mapping_candidates(tickers: Iterable[str], limit: int = 30) -> list[str]:
+    """
+    Devuelve una lista de tickers para mapping manual, intentando evitar deportes.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for tk in tickers:
+        if not tk or tk in seen:
+            continue
+        seen.add(tk)
+
+        if _looks_like_sports_ticker(tk):
+            continue
+
+        out.append(tk)
+        if len(out) >= limit:
+            break
+
+    return out
+
+
 def main() -> int:
     args = parse_args()
     config = load_config()
@@ -61,16 +136,31 @@ def main() -> int:
         provider_b = PolymarketStubProvider()
         snapshots_b = list(provider_b.fetch_market_snapshots())
 
-        # 3) Mappings manuales (todavía no los usamos para fetch real porque Polymarket es stub)
+        # 3) Mappings manuales
         mappings = load_manual_mappings()
         if not mappings:
             print(summarize_config(config))
-            print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
+            print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py\n")
+
+            # Sugerencias de tickers Kalshi (no-deportes, heurístico)
+            kalshi_tickers = [s.market.market_id for s in snapshots_a]
+            suggestions = _suggest_kalshi_mapping_candidates(kalshi_tickers, limit=30)
+
+            if suggestions:
+                print("Kalshi mapping candidates (heuristic non-sports, top 30):")
+                for tk in suggestions:
+                    print(f"  - {tk}")
+                print("\nNext: pick ~10 of these and map them to Polymarket slugs in arb_scanner/mappings.py")
+                print("Example line:")
+                print('  MarketMapping(kalshi_ticker="KX....", polymarket_slug="some-polymarket-slug")')
+            else:
+                print("No non-sports candidates found in current sample. Increase KALSHI_PAGES/KALSHI_LIMIT or adjust filters.")
             return 0
 
         print(summarize_config(config))
         print(f"Loaded {len(mappings)} manual mappings. (Polymarket is stub for now)")
-        # Seguimos para imprimir near-miss de Kalshi (y luego cross cuando Polymarket sea real)
+        # Nota: aún no usamos mappings para hacer fetch en Polymarket porque sigue siendo stub.
+        # En cuanto implementemos Polymarket read-only real, aquí filtraremos por esos mappings.
 
     elif args.kalshi_market_prices:
         from arb_scanner.kalshi_public import KalshiPublicClient
@@ -155,3 +245,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
