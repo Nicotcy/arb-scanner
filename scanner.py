@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections import Counter
+from dataclasses import replace
 from typing import Iterable
 
 from arb_scanner.config import load_config
@@ -22,6 +23,13 @@ from arb_scanner.sources.stub import StubProvider
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--mode",
+        choices=["lab", "safe"],
+        default=os.getenv("MODE", "lab"),
+        help="Policy mode: lab (more observability) vs safe (stricter thresholds/liq).",
+    )
 
     parser.add_argument("--use-stub", action="store_true", help="Use stub providers.")
     parser.add_argument("--use-kalshi", action="store_true", help="Use Kalshi read-only snapshots.")
@@ -114,8 +122,8 @@ def _suggestions(tickers: Iterable[str], limit_safe: int = 25) -> tuple[list[str
 
 def _resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapping]:
     """
-    For mappings missing token IDs, resolve via Gamma:
-    Gamma markets include clobTokenIds=[YES,NO] for binary markets. :contentReference[oaicite:7]{index=7}
+    For mappings missing token IDs, resolve via Gamma.
+    Gamma markets include clobTokenIds=[YES,NO] for binary markets.
     """
     client = PolymarketPublicClient()
     out: list[MarketMapping] = []
@@ -146,6 +154,8 @@ def _resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapp
 def main() -> int:
     args = parse_args()
     config = load_config()
+    # CLI overrides env MODE (config.mode).
+    config = replace(config, mode=str(args.mode).lower())
 
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
@@ -247,6 +257,7 @@ def main() -> int:
                 print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
                 return 0
 
+            # SAFE requires whitelist / mappings for cross-venue by design.
             resolved = _resolve_polymarket_tokens(mappings)
 
             unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
@@ -262,7 +273,13 @@ def main() -> int:
             snapshots_b = list(provider_b.fetch_market_snapshots())
 
         else:
-            raise SystemExit("Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, --suggest-safe, or --kalshi-market-prices")
+            raise SystemExit(
+                "Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, --suggest-safe, or --kalshi-market-prices"
+            )
+
+    # Guardrail: SAFE + cross-venue without mappings is nonsense.
+    if config.mode == "safe" and snapshots_b and not args.use_mapping:
+        raise SystemExit("SAFE mode with cross-venue requires --use-mapping (whitelist).")
 
     opportunities = []
     if snapshots_b:
