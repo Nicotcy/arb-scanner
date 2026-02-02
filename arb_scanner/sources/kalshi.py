@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 from arb_scanner.kalshi_public import KalshiPublicClient
 from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
@@ -17,6 +17,8 @@ class KalshiStats:
     liqskip: int = 0
     one_sided: int = 0
     two_sided: int = 0
+    prefilter_skipped: int = 0
+    prefilter_kept: int = 0
 
 
 class KalshiProvider:
@@ -25,20 +27,41 @@ class KalshiProvider:
 
     Kalshi orderbook returns bids-only per outcome; asks are derived in KalshiPublicClient.fetch_top_of_book().
     We treat derived asks as buyable top-of-book for scanner purposes.
+
+    Optimization: allow prefiltering tickers BEFORE fetching orderbooks, to avoid thousands of HTTP calls.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        ticker_filter: Callable[[str], bool] | None = None,
+        include_tickers: set[str] | None = None,
+    ) -> None:
         self.client = KalshiPublicClient()
 
-        self.max_pages = int(os.getenv("KALSHI_PAGES", "3"))
+        self.max_pages = int(os.getenv("KALSHI_PAGES", "25"))
         self.limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
 
         # Minimal executability filter (can be overridden)
         self.min_exec_size = float(os.getenv("KALSHI_MIN_EXEC_SIZE", "1.0"))
 
+        # Prefiltering (only one should be used; include_tickers takes precedence if provided)
+        self.ticker_filter = ticker_filter
+        self.include_tickers = include_tickers
+
         # Tiny debug to explain why we get noprices=all
         self.debug = os.getenv("KALSHI_PROVIDER_DEBUG", "0") in {"1", "true", "yes", "on"}
         self.debug_limit = int(os.getenv("KALSHI_PROVIDER_DEBUG_LIMIT", "3"))
+
+    def _keep_ticker(self, ticker: str) -> bool:
+        if self.include_tickers is not None:
+            return ticker in self.include_tickers
+        if self.ticker_filter is not None:
+            try:
+                return bool(self.ticker_filter(ticker))
+            except Exception:
+                # If filter explodes, fail closed (skip) rather than DDOS ourselves
+                return False
+        return True
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         stats = KalshiStats()
@@ -52,6 +75,11 @@ class KalshiProvider:
             ticker = m.get("ticker")
             if not ticker:
                 continue
+
+            if not self._keep_ticker(ticker):
+                stats.prefilter_skipped += 1
+                continue
+            stats.prefilter_kept += 1
 
             try:
                 top = self.client.fetch_top_of_book(ticker)
@@ -102,6 +130,12 @@ class KalshiProvider:
             stats.ok += 1
             stats.two_sided += 1
             yield MarketSnapshot(market=market, orderbook=ob)
+
+        if stats.prefilter_skipped > 0:
+            print(
+                f"KalshiProvider prefilter: kept={stats.prefilter_kept} skipped={stats.prefilter_skipped} "
+                f"from_listed={stats.total}"
+            )
 
         print(
             "KalshiProvider stats: "
