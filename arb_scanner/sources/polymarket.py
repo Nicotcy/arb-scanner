@@ -13,7 +13,7 @@ class PolymarketProvider:
     Read-only provider for Polymarket using manual mappings.
 
     Emits MarketSnapshot objects compatible with the core scanner.
-    Prices are already probabilities in [0, 1].
+    Prices are probabilities in [0, 1].
     """
 
     mappings: list[MarketMapping]
@@ -27,7 +27,7 @@ class PolymarketProvider:
         assert self.client is not None
 
         for mp in self.mappings:
-            # We need resolved YES / NO token IDs
+            # Require resolved YES / NO token IDs
             if not mp.polymarket_yes_token_id or not mp.polymarket_no_token_id:
                 continue
 
@@ -40,9 +40,12 @@ class PolymarketProvider:
             if not yes_book.best_ask or not no_book.best_ask:
                 continue
 
+            # Minimal but valid Market object
             market = Market(
                 venue="Polymarket",
                 market_id=mp.polymarket_slug,
+                question=mp.polymarket_slug.replace("-", " ").capitalize(),
+                outcomes=["YES", "NO"],
             )
 
             orderbook = OrderBookTop(
