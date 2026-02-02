@@ -1,4 +1,13 @@
-"""Read-only Kalshi public market data client."""
+"""Read-only Kalshi public market data client.
+
+IMPORTANT:
+The public /trade-api/v2/markets/{ticker}/orderbook endpoint we can access returns
+a single list per outcome (yes/no). It does NOT separate bids vs asks.
+
+Therefore, we cannot safely infer a tradeable top-of-book (bid/ask) from it.
+Until a proper endpoint exists (or we validate the semantics), we return None
+for bid/ask to avoid fake edges.
+"""
 
 from __future__ import annotations
 
@@ -64,10 +73,6 @@ class KalshiPublicClient:
         return self._get(f"/markets/{ticker}")
 
     def probe_endpoints(self, ticker: str) -> list[dict[str, Any]]:
-        """
-        Try a small set of likely endpoints and return a compact summary of the response shape.
-        This is for discovery/debug only.
-        """
         candidates = [
             f"/markets/{ticker}/orderbook",
             f"/markets/{ticker}/orderbook?depth=1",
@@ -90,13 +95,9 @@ class KalshiPublicClient:
 
     def fetch_top_of_book(self, ticker: str) -> KalshiTopOfBook:
         """
-        CURRENT STATE:
-        The public orderbook endpoint you hit returns a single list per outcome
-        (not separated bids vs asks). Therefore, we cannot safely infer buyable
-        ask prices from it. We return None for asks/bids until a correct endpoint
-        is identified.
+        Conservative behavior:
+        returns None for bids/asks until we can reliably infer tradeable bid/ask.
         """
-        _ = self.get_orderbook(ticker)
         return KalshiTopOfBook(
             ticker=ticker,
             yes_bid=None,
@@ -115,7 +116,6 @@ class KalshiPublicClient:
         params: dict[str, Any] | None = None,
         raw_path: bool = False,
     ) -> dict[str, Any]:
-        # If raw_path=True, path already contains any query params.
         url = f"{self.base_url}{path}" if raw_path else f"{self.base_url}{path}"
 
         for attempt in range(5):
@@ -139,7 +139,6 @@ def _summarize_payload(path: str, payload: Any) -> dict[str, Any]:
     if isinstance(payload, dict):
         keys = list(payload.keys())
         summary["keys"] = keys[:30]
-        # drill into possible orderbook-like objects
         ob = payload.get("orderbook") if "orderbook" in payload else None
         if isinstance(ob, dict):
             summary["orderbook_keys"] = list(ob.keys())[:30]
