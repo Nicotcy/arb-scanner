@@ -43,6 +43,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--tightest-min-exec",
+        type=float,
+        default=0.0,
+        help=(
+            "Override minimum executable size used ONLY for the Tightest table. "
+            "0 means: auto (LAB+Kalshi-only -> 50; otherwise uses global min_exec_size)."
+        ),
+    )
+
     parser.add_argument("--use-stub", action="store_true", help="Use stub providers.")
     parser.add_argument("--use-kalshi", action="store_true", help="Use Kalshi read-only snapshots.")
     parser.add_argument(
@@ -289,9 +299,19 @@ def main() -> int:
         else:
             raise SystemExit("Choose one: --use-kalshi, --use-mapping, --use-mapping-stub, or --use-stub")
 
+    # Tightest table min-exec is intentionally separate from global policy min_exec_size.
+    if args.tightest_min_exec and args.tightest_min_exec > 0:
+        tightest_min_exec = float(args.tightest_min_exec)
+    else:
+        if args.use_kalshi and config.mode == "lab":
+            tightest_min_exec = 50.0
+        else:
+            tightest_min_exec = float(config.min_executable_size)
+
     print(
         summarize_config(config)
         + (f" lab_universe={lab_universe}" if config.mode == "lab" and args.use_kalshi else "")
+        + (f" tightest_min_exec={tightest_min_exec:.2f}" if args.use_kalshi and config.mode == "lab" else "")
     )
 
     opportunities = []
@@ -323,7 +343,12 @@ def main() -> int:
     if args.use_kalshi and config.mode == "lab":
         from arb_scanner.scanner import format_tightest_markets_table
 
-        tight = format_tightest_markets_table(snapshots_a, config, limit=20)
+        tight = format_tightest_markets_table(
+            snapshots_a,
+            config,
+            limit=20,
+            min_exec_size=tightest_min_exec,
+        )
         if tight:
             print("Tightest internal Kalshi markets (top 20):")
             print(tight)
