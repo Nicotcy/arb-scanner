@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import Any, Iterable
+from typing import Any
 
 import requests
 
@@ -20,10 +20,10 @@ class KalshiTopOfBook:
     yes_ask: float | None
     no_bid: float | None
     no_ask: float | None
-    yes_bid_qty: int | None
-    no_bid_qty: int | None
-    yes_ask_qty: int | None
-    no_ask_qty: int | None
+    yes_bid_qty: float | None
+    no_bid_qty: float | None
+    yes_ask_qty: float | None
+    no_ask_qty: float | None
 
 
 class KalshiPublicClient:
@@ -40,9 +40,7 @@ class KalshiPublicClient:
         )
         self.timeout = float(os.getenv("KALSHI_TIMEOUT", "15"))
 
-    def list_open_markets(
-        self, max_pages: int = 3, limit_per_page: int = 200
-    ) -> Iterable[dict[str, Any]]:
+    def list_open_markets(self, max_pages: int = 3, limit_per_page: int = 200):
         cursor = None
         pages = 0
 
@@ -62,45 +60,67 @@ class KalshiPublicClient:
     def get_orderbook(self, ticker: str) -> dict[str, Any]:
         return self._get(f"/markets/{ticker}/orderbook")
 
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        return self._get(f"/markets/{ticker}")
+
+    def probe_endpoints(self, ticker: str) -> list[dict[str, Any]]:
+        """
+        Try a small set of likely endpoints and return a compact summary of the response shape.
+        This is for discovery/debug only.
+        """
+        candidates = [
+            f"/markets/{ticker}/orderbook",
+            f"/markets/{ticker}/orderbook?depth=1",
+            f"/markets/{ticker}/orderbook?depth=5",
+            f"/markets/{ticker}",
+            f"/markets/{ticker}/prices",
+            f"/markets/{ticker}/orderbook_summary",
+            f"/markets/{ticker}/orderbook-top",
+            f"/markets/{ticker}/book",
+        ]
+
+        out: list[dict[str, Any]] = []
+        for path in candidates:
+            try:
+                payload = self._get(path, params=None, raw_path=True)
+                out.append(_summarize_payload(path, payload))
+            except Exception as e:
+                out.append({"path": path, "ok": False, "error": str(e)})
+        return out
+
     def fetch_top_of_book(self, ticker: str) -> KalshiTopOfBook:
-        payload = self.get_orderbook(ticker)
-
-        if os.getenv("KALSHI_DEBUG_ORDERBOOK") == "1":
-            print(f"orderbook debug ticker={ticker}")
-            print(f"orderbook top-level keys={list(payload.keys())}")
-            orderbook = payload.get("orderbook")
-            if isinstance(orderbook, dict):
-                print(f"orderbook keys={list(orderbook.keys())}")
-
-        orderbook = payload.get("orderbook") or payload
-
-        yes_bid, yes_bid_qty = _extract_best_bid(orderbook.get("yes"))
-        no_bid, no_bid_qty = _extract_best_bid(orderbook.get("no"))
-        yes_ask, yes_ask_qty = _extract_best_ask(orderbook.get("yes"))
-        no_ask, no_ask_qty = _extract_best_ask(orderbook.get("no"))
-
-        yes_bid = _cents_to_dollars(yes_bid)
-        no_bid = _cents_to_dollars(no_bid)
-        yes_ask = _cents_to_dollars(yes_ask)
-        no_ask = _cents_to_dollars(no_ask)
-
+        """
+        CURRENT STATE:
+        The public orderbook endpoint you hit returns a single list per outcome
+        (not separated bids vs asks). Therefore, we cannot safely infer buyable
+        ask prices from it. We return None for asks/bids until a correct endpoint
+        is identified.
+        """
+        _ = self.get_orderbook(ticker)
         return KalshiTopOfBook(
             ticker=ticker,
-            yes_bid=yes_bid,
-            yes_ask=yes_ask,
-            no_bid=no_bid,
-            no_ask=no_ask,
-            yes_bid_qty=yes_bid_qty,
-            no_bid_qty=no_bid_qty,
-            yes_ask_qty=yes_ask_qty,
-            no_ask_qty=no_ask_qty,
+            yes_bid=None,
+            yes_ask=None,
+            no_bid=None,
+            no_ask=None,
+            yes_bid_qty=None,
+            no_bid_qty=None,
+            yes_ask_qty=None,
+            no_ask_qty=None,
         )
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
+    def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        raw_path: bool = False,
+    ) -> dict[str, Any]:
+        # If raw_path=True, path already contains any query params.
+        url = f"{self.base_url}{path}" if raw_path else f"{self.base_url}{path}"
+
         for attempt in range(5):
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(url, params=params if not raw_path else None, timeout=self.timeout)
                 if resp.status_code == 429:
                     time.sleep(0.5 * (attempt + 1))
                     continue
@@ -113,95 +133,29 @@ class KalshiPublicClient:
         raise RuntimeError("unreachable")
 
 
-def _extract_best_bid(side: Any) -> tuple[int | None, int | None]:
-    if side is None:
-        return None, None
+def _summarize_payload(path: str, payload: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {"path": path, "ok": True, "type": type(payload).__name__}
 
-    bids = None
-    if isinstance(side, dict):
-        bids = side.get("bids") or side.get("orders")
-    else:
-        bids = side
+    if isinstance(payload, dict):
+        keys = list(payload.keys())
+        summary["keys"] = keys[:30]
+        # drill into possible orderbook-like objects
+        ob = payload.get("orderbook") if "orderbook" in payload else None
+        if isinstance(ob, dict):
+            summary["orderbook_keys"] = list(ob.keys())[:30]
+            for side in ("yes", "no"):
+                v = ob.get(side)
+                summary[f"orderbook_{side}_type"] = type(v).__name__
+                if isinstance(v, dict):
+                    summary[f"{side}_keys"] = list(v.keys())[:30]
+                elif isinstance(v, list):
+                    summary[f"{side}_len"] = len(v)
+                    summary[f"{side}_head"] = v[:3]
+        return summary
 
-    if not bids:
-        return None, None
+    if isinstance(payload, list):
+        summary["len"] = len(payload)
+        summary["head"] = payload[:3]
+        return summary
 
-    best_price: int | None = None
-    best_qty: int | None = None
-
-    for bid in bids:
-        price = None
-        qty = None
-        if isinstance(bid, dict):
-            price = bid.get("price") or bid.get("p")
-            qty = bid.get("quantity") or bid.get("size") or bid.get("qty")
-        elif isinstance(bid, (list, tuple)) and len(bid) >= 2:
-            price, qty = bid[0], bid[1]
-
-        price = _coerce_int(price)
-        qty = _coerce_int(qty)
-
-        if price is None:
-            continue
-        if best_price is None or price > best_price:
-            best_price = price
-            best_qty = qty
-
-    return best_price, best_qty
-
-
-def _extract_best_ask(side: Any) -> tuple[int | None, int | None]:
-    """
-    IMPORTANT: For asks, we do NOT fall back to "orders".
-    In some Kalshi payloads, "orders" may represent bids or mixed orders,
-    which creates fake 1-cent asks everywhere.
-    """
-    if side is None:
-        return None, None
-
-    asks = None
-    if isinstance(side, dict):
-        asks = side.get("asks") or side.get("offers")
-    else:
-        asks = side
-
-    if not asks:
-        return None, None
-
-    best_price: int | None = None
-    best_qty: int | None = None
-
-    for ask in asks:
-        price = None
-        qty = None
-        if isinstance(ask, dict):
-            price = ask.get("price") or ask.get("p")
-            qty = ask.get("quantity") or ask.get("size") or ask.get("qty")
-        elif isinstance(ask, (list, tuple)) and len(ask) >= 2:
-            price, qty = ask[0], ask[1]
-
-        price = _coerce_int(price)
-        qty = _coerce_int(qty)
-
-        if price is None:
-            continue
-        if best_price is None or price < best_price:
-            best_price = price
-            best_qty = qty
-
-    return best_price, best_qty
-
-
-def _coerce_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _cents_to_dollars(value: int | None) -> float | None:
-    if value is None:
-        return None
-    return value / 100
+    return summary
