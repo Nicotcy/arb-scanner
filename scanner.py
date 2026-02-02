@@ -36,13 +36,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--suggest-mappings",
         action="store_true",
-        help="Print Kalshi ticker suggestions for manual mappings.",
+        help="Print Kalshi ticker suggestions for manual mappings (broad, includes sports).",
+    )
+    parser.add_argument(
+        "--suggest-safe",
+        action="store_true",
+        help="Print ONLY 'safer' Kalshi candidates (non-sports by strict rules).",
     )
 
     return parser.parse_args()
 
 
-def _looks_like_sports_ticker(ticker: str) -> bool:
+def _is_any_sports(ticker: str) -> bool:
     t = ticker.upper()
     sports_prefixes = (
         "KXNBA",
@@ -55,50 +60,31 @@ def _looks_like_sports_ticker(ticker: str) -> bool:
         "KXSOCCER",
         "KXCFB",
         "KXNCAA",
+        "KXEPL",  # IMPORTANT: EPL también es deporte
+        "KXSB",   # Super Bowl
     )
     return t.startswith(sports_prefixes)
 
 
 def _looks_like_player_prop(ticker: str) -> bool:
-    """
-    Props típicos: pts/reb/ast/yds/td etc.
-    Estos NO son buenos para 'seguro', pero sirven para testear pipeline si no hay otra cosa.
-    """
     t = ticker.upper()
     prop_markers = (
-        "PTS",
-        "REB",
-        "AST",
-        "STL",
-        "BLK",
-        "3PT",
-        "RSH",
-        "PASS",
-        "REC",
-        "TD",
-        "YDS",
-        "GOALS",
-        "SACK",
-        "INT",
+        "PTS", "REB", "AST", "STL", "BLK", "3PT",
+        "RSH", "PASS", "REC", "TD", "YDS",
+        "GOALS", "SACK", "INT",
+        "BTTS",  # both teams to score (soccer prop)
     )
     return any(m in t for m in prop_markers)
 
 
 def _suggestions(
     tickers: Iterable[str],
-    limit_non_sports: int = 20,
+    limit_safe: int = 25,
     limit_sports_non_props: int = 20,
 ) -> tuple[list[str], list[str], dict]:
-    """
-    Devuelve:
-      - non_sports: tickers no deportivos (preferibles para mappings 'seguros')
-      - sports_non_props: tickers deportivos pero no-props (para test/pipeline, riesgo alto)
-      - stats: conteos de filtrado
-    """
-    non_sports: list[str] = []
+    safe: list[str] = []
     sports_non_props: list[str] = []
     seen: set[str] = set()
-
     stats = Counter()
 
     for tk in tickers:
@@ -106,7 +92,7 @@ def _suggestions(
             continue
         seen.add(tk)
 
-        is_sports = _looks_like_sports_ticker(tk)
+        is_sports = _is_any_sports(tk)
         is_prop = _looks_like_player_prop(tk)
 
         if is_sports:
@@ -115,46 +101,46 @@ def _suggestions(
                 sports_non_props.append(tk)
                 stats["sports_non_props_kept"] += 1
             else:
-                stats["sports_props_skipped"] += 1
+                stats["sports_skipped"] += 1
         else:
-            stats["non_sports_total"] += 1
-            if len(non_sports) < limit_non_sports:
-                non_sports.append(tk)
-                stats["non_sports_kept"] += 1
+            stats["safe_total"] += 1
+            if len(safe) < limit_safe:
+                safe.append(tk)
+                stats["safe_kept"] += 1
 
-        if len(non_sports) >= limit_non_sports and len(sports_non_props) >= limit_sports_non_props:
+        if len(safe) >= limit_safe and len(sports_non_props) >= limit_sports_non_props:
             break
 
-    return non_sports, sports_non_props, dict(stats)
+    return safe, sports_non_props, dict(stats)
 
 
-def _print_mapping_suggestions(snapshots_a) -> None:
+def _print_mapping_suggestions(snapshots_a, safe_only: bool) -> None:
     kalshi_tickers = [s.market.market_id for s in snapshots_a]
-    non_sports, sports_non_props, stats = _suggestions(kalshi_tickers, 20, 20)
+    safe, sports_non_props, stats = _suggestions(kalshi_tickers, 25, 20)
 
     print("Suggestion stats:", stats)
 
-    if non_sports:
-        print("\nPreferred (non-sports) Kalshi mapping candidates (top 20):")
-        for tk in non_sports:
+    if safe:
+        print("\nSAFE candidates (strict non-sports, top 25):")
+        for tk in safe:
             print(f"  - {tk}")
     else:
-        print("\nPreferred (non-sports) Kalshi mapping candidates: NONE found in this sample.")
-        print("This likely means current open markets are dominated by sports.")
+        print("\nSAFE candidates: NONE found in this sample.")
+        print("Meaning: current open Kalshi markets are basically sports. That's normal on many days.")
 
-    if sports_non_props:
-        print("\nFallback (sports but NON-props) candidates for pipeline testing (riskier, top 20):")
-        for tk in sports_non_props:
-            print(f"  - {tk}")
-    else:
-        print("\nFallback (sports non-props): NONE found.")
+    if not safe_only:
+        if sports_non_props:
+            print("\nFALLBACK candidates (sports but NON-props) for pipeline testing ONLY (riskier, top 20):")
+            for tk in sports_non_props:
+                print(f"  - {tk}")
+        else:
+            print("\nFallback (sports non-props): NONE found.")
 
 
 def main() -> int:
     args = parse_args()
     config = load_config()
 
-    # Mantener DRY_RUN encendido por seguridad
     if not config.dry_run:
         raise SystemExit("DRY_RUN must remain enabled for this scanner.")
 
@@ -218,14 +204,19 @@ def main() -> int:
 
         return 0
 
-    elif args.use_kalshi or args.use_mapping or args.suggest_mappings:
+    elif args.use_kalshi or args.use_mapping or args.suggest_mappings or args.suggest_safe:
         provider = KalshiProvider()
         snapshots_a = list(provider.fetch_market_snapshots())
         snapshots_b = []
 
-        if args.suggest_mappings and not args.use_mapping:
+        if args.suggest_mappings:
             print(summarize_config(config))
-            _print_mapping_suggestions(snapshots_a)
+            _print_mapping_suggestions(snapshots_a, safe_only=False)
+            return 0
+
+        if args.suggest_safe:
+            print(summarize_config(config))
+            _print_mapping_suggestions(snapshots_a, safe_only=True)
             return 0
 
         if args.use_mapping:
@@ -235,17 +226,19 @@ def main() -> int:
             mappings: list[MarketMapping] = load_manual_mappings()
             if not mappings:
                 print(summarize_config(config))
-                print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py")
-                _print_mapping_suggestions(snapshots_a)
-                print("\nNext: pick ~10 preferred non-sports tickers (if any) and map to Polymarket slugs.")
-                print('Example: MarketMapping(kalshi_ticker="KX....", polymarket_slug="some-polymarket-slug")')
+                print("No manual mappings defined yet. Add mappings in arb_scanner/mappings.py\n")
+                _print_mapping_suggestions(snapshots_a, safe_only=True)
+                print("\nNext: if SAFE list is empty, stop trying to map from Kalshi today.")
+                print("We will instead pick SAFE markets from Polymarket and search their Kalshi equivalents.")
                 return 0
 
             print(summarize_config(config))
             print(f"Loaded {len(mappings)} manual mappings. (Polymarket is stub for now)")
 
     else:
-        raise SystemExit("Choose one: --use-stub, --use-kalshi, --use-mapping, --suggest-mappings, or --kalshi-market-prices")
+        raise SystemExit(
+            "Choose one: --use-stub, --use-kalshi, --use-mapping, --suggest-mappings, --suggest-safe, or --kalshi-market-prices"
+        )
 
     opportunities = []
     if snapshots_b:
