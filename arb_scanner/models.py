@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,8 @@ class Opportunity:
     buy_yes_price: float
     buy_no_venue: str
     buy_no_price: float
+    sum_price: float
+    executable_size: float
     edge: float
 
 
@@ -53,7 +55,9 @@ def iter_pairs(
     """
     Yield tuples of snapshots from two venues keyed by normalized question + outcomes.
 
-    Nota: esto es un helper opcional; ahora mismo tu scanner hace matching por (question, outcomes) exactos.
+    Nota: este helper sirve para el matching rápido. En cross-venue SAFE
+    normalmente ya vienes con mappings/whitelist, así que no pretendemos
+    “descubrir” matches por NLP aquí.
     """
     index: dict[tuple[str, tuple[str, ...]], MarketSnapshot] = {
         (normalize_question(ms.market.question), tuple(ms.market.outcomes)): ms for ms in markets_b
@@ -63,3 +67,4 @@ def iter_pairs(
         match = index.get(key)
         if match:
             yield ms, match
+
