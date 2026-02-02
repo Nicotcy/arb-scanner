@@ -23,10 +23,8 @@ class KalshiProvider:
     """
     Read-only provider using Kalshi public trade-api.
 
-    IMPORTANT:
-    Kalshi /markets/{ticker}/orderbook returns bids only.
-    Our KalshiPublicClient.fetch_top_of_book derives asks by complementarity.
-    We treat derived asks as "buyable" top-of-book for scanner purposes.
+    Kalshi orderbook returns bids-only per outcome; asks are derived in KalshiPublicClient.fetch_top_of_book().
+    We treat derived asks as buyable top-of-book for scanner purposes.
     """
 
     def __init__(self) -> None:
@@ -35,11 +33,12 @@ class KalshiProvider:
         self.max_pages = int(os.getenv("KALSHI_PAGES", "3"))
         self.limit_per_page = int(os.getenv("KALSHI_LIMIT", "200"))
 
-        # Liquidity filters (very light)
-        self.min_exec_size = float(os.getenv("KALSHI_MIN_EXEC_SIZE", "1"))
+        # Minimal executability filter (can be overridden)
+        self.min_exec_size = float(os.getenv("KALSHI_MIN_EXEC_SIZE", "1.0"))
 
-        # If you had blacklist logic previously, keep env knobs
-        self.blacklist_max_filtered_ratio = float(os.getenv("KALSHI_BLACKLIST_MAX_FILTERED_RATIO", "0.95"))
+        # Tiny debug to explain why we get noprices=all
+        self.debug = os.getenv("KALSHI_PROVIDER_DEBUG", "0") in {"1", "true", "yes", "on"}
+        self.debug_limit = int(os.getenv("KALSHI_PROVIDER_DEBUG_LIMIT", "3"))
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         stats = KalshiStats()
@@ -47,21 +46,32 @@ class KalshiProvider:
         markets = list(self.client.list_open_markets(max_pages=self.max_pages, limit_per_page=self.limit_per_page))
         stats.total = len(markets)
 
-        # If later you reintroduce blacklist, do it here.
-        used = markets
+        dbg_printed = 0
 
-        for m in used:
+        for m in markets:
             ticker = m.get("ticker")
             if not ticker:
                 continue
 
             try:
                 top = self.client.fetch_top_of_book(ticker)
-            except Exception:
+            except Exception as e:
                 stats.errors += 1
+                if self.debug and dbg_printed < self.debug_limit:
+                    print(f"[KALSHI_PROVIDER_DEBUG] ERROR ticker={ticker} err={e}")
+                    dbg_printed += 1
                 continue
 
-            # We require derived asks to exist to consider it tradeable.
+            if self.debug and dbg_printed < self.debug_limit:
+                print(
+                    "[KALSHI_PROVIDER_DEBUG] "
+                    f"ticker={ticker} yes_bid={top.yes_bid} yes_ask={top.yes_ask} "
+                    f"no_bid={top.no_bid} no_ask={top.no_ask} "
+                    f"yes_ask_qty={top.yes_ask_qty} no_ask_qty={top.no_ask_qty}"
+                )
+                dbg_printed += 1
+
+            # Require derived asks to exist
             if top.yes_ask is None or top.no_ask is None:
                 stats.noprices += 1
                 continue
@@ -71,7 +81,6 @@ class KalshiProvider:
             yes_sz = float(top.yes_ask_qty or 0.0)
             no_sz = float(top.no_ask_qty or 0.0)
 
-            # Minimal executability filter (optional)
             if yes_sz < self.min_exec_size or no_sz < self.min_exec_size:
                 stats.liqskip += 1
                 continue
@@ -83,7 +92,6 @@ class KalshiProvider:
                 best_no_size=no_sz,
             )
 
-            # Heuristic: these are binary markets (YES/NO)
             market = Market(
                 venue="Kalshi",
                 market_id=ticker,
@@ -91,7 +99,6 @@ class KalshiProvider:
                 outcomes=("YES", "NO"),
             )
 
-            # Two-sided (asks exist for both)
             stats.ok += 1
             stats.two_sided += 1
             yield MarketSnapshot(market=market, orderbook=ob)
