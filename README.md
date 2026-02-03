@@ -1,45 +1,37 @@
-# arb-scanner
+# Big-step patch (arb-scanner)
 
-Read-only scanner (no trading) for Kalshi + Polymarket. The default workflow keeps `DRY_RUN=1` and uses stub data until you wire real APIs.
+This is a *patch pack* you can copy into your existing repo.
+It avoids "install/packaging" changes and focuses on a big productivity jump:
 
-## Quick start (macOS)
+1) Polymarket outcomes normalization (Gamma sometimes returns outcomes as a JSON string).
+2) A robust SAFE filter tool for Polymarket lists (outputs JSON with normalized outcomes list).
+3) A SAFE/LAB mapping split with a single loader function (keeps backwards compatibility).
+4) A slightly safer/portable kalshi_find_candidates (adds sys.path injection) + writes candidates JSON.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 scanner.py --use-stub
-```
+## How to apply (manual, simple)
+From your repo root (where daemon.py lives), copy these files over, overwriting if prompted:
 
-### Environment flags
+- tools/poly_list_active.py
+- tools/poly_filter_safe.py
+- arb_scanner/mappings.py
+- tools/kalshi_find_candidates.py  (optional if you already have it; mine includes portability tweaks)
 
-```bash
-export DRY_RUN=1          # enforced default; scanner exits if set to 0
-export ALERT_ONLY=0       # set to 1 to print only opportunities above threshold
-export ALERT_THRESHOLD=0.02
-export FEE_BUFFER_BPS=25  # fee + slippage buffer
-```
+## Quick smoke flow
+1) Produce active markets:
+   python3 tools/poly_list_active.py --limit 500 --min-liquidity 500 > /tmp/poly_active.json
 
-### ALERT_ONLY example
+2) Make SAFE shortlist:
+   python3 tools/poly_filter_safe.py --in /tmp/poly_active.json --out /tmp/poly_active_safe.json
 
-```bash
-export ALERT_ONLY=1
-export ALERT_THRESHOLD=0.02
-python3 scanner.py --use-stub
-```
+3) Find Kalshi candidates:
+   python3 tools/kalshi_find_candidates.py --poly-json /tmp/poly_active_safe.json --top 8 --max-poly 20 --refresh-kalshi
 
-## Output fields
+4) Add a few mappings into:
+   arb_scanner/mappings.py  (SAFE_MAPPINGS or LAB_MAPPINGS)
 
-Each candidate prints:
+5) Run daemon:
+   python3 daemon.py --use-kalshi --use-mapping --mode lab
+   python3 daemon.py --use-kalshi --use-mapping --mode safe
 
-- `market_pair`
-- `best_yes_price_A`
-- `best_no_price_B`
-- `hedge_cost`
-- `estimated_fees` (buffered)
-- `top_of_book_liquidity`
-- `market_mismatch` (flagged when not pure YES/NO)
-- `net_edge`
-
-## External reference analysis
-
-See `docs/external_analysis.md` for notes on how to inspect `pmxt` and `realfishsam/prediction-market-arbitrage-bot` for market/orderbook modules and credential handling.
+## Rollback
+Because this is just file copy, rollback is "git checkout" or restore from your previous folder.
