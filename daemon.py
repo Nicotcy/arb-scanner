@@ -160,6 +160,14 @@ def _read_botctl(path: str) -> dict:
         return {}
 
 
+def _summarize_rows(rows: list[SnapshotRow]) -> str:
+    by_venue: dict[str, int] = {}
+    for r in rows:
+        by_venue[r.venue] = by_venue.get(r.venue, 0) + 1
+    parts = [f"{k}={v}" for k, v in sorted(by_venue.items())]
+    return " ".join(parts) if parts else "none"
+
+
 def main() -> int:
     args = parse_args()
 
@@ -179,8 +187,7 @@ def main() -> int:
         cap=float(os.getenv("NET_BACKOFF_CAP", "600")),
     )
 
-    # Housekeeping knobs
-    prune_every = int(os.getenv("PRUNE_EVERY_SECS", "1800"))  # 30 min
+    prune_every = int(os.getenv("PRUNE_EVERY_SECS", "1800"))
     keep_days = int(os.getenv("SNAPSHOT_TTL_DAYS", "7"))
 
     settle_every = int(os.getenv("PAPER_SETTLE_EVERY_SECS", "30"))
@@ -189,7 +196,6 @@ def main() -> int:
     trade_cooldown = int(os.getenv("TRADE_COOLDOWN_SECS", "120"))
     last_trade_by_key: dict[str, int] = {}
 
-    # Initialize paper executor (it does nothing unless botctl enables it)
     paper_cfg = PaperConfig(settle_after_secs=paper_settle_after)
     paper = PaperExecutor(store, cfg=paper_cfg)
 
@@ -202,7 +208,7 @@ def main() -> int:
     if args.use_mapping:
         mappings = load_manual_mappings()
         if not mappings:
-            raise SystemExit("No mappings defined in arb_scanner/mappings.py")
+            raise SystemExit("No manual mappings defined yet. Add .data/mappings.json (or implement mappings.py loader).")
 
         resolved = resolve_polymarket_tokens(mappings)
         unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
@@ -211,7 +217,9 @@ def main() -> int:
             for m in unresolved:
                 print(f"  - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
             raise SystemExit(2)
+
         resolved_mappings = resolved
+        print(f"[daemon] loaded mappings={len(resolved_mappings)} (all resolved yes/no token ids)")
 
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
 
@@ -224,9 +232,6 @@ def main() -> int:
         try:
             now = int(time.time())
 
-            # -------------------------
-            # control-plane refresh
-            # -------------------------
             if now - last_botctl_ts >= 2:
                 botctl_cache = _read_botctl(args.botctl_path)
                 last_botctl_ts = now
@@ -237,17 +242,12 @@ def main() -> int:
             max_per_trade = float(botctl_cache.get("max_per_trade", 50.0))
             bankroll = float(botctl_cache.get("bankroll", 1000.0))
 
-            # Sync bankroll into paper engine once (if user changed it).
             if store.paper_get("bankroll_set") != True:
-                # only set once on first boot unless you clear paper_state
                 store.paper_set("free_balance", bankroll)
                 store.paper_set("locked_balance", 0.0)
                 store.paper_set("realized_pnl", 0.0)
                 store.paper_set("bankroll_set", True)
 
-            # -------------------------
-            # housekeeping
-            # -------------------------
             if keep_days > 0 and now - last_prune_ts >= prune_every:
                 deleted = store.prune_snapshots(keep_days=keep_days)
                 store.wal_checkpoint("TRUNCATE")
@@ -261,9 +261,6 @@ def main() -> int:
                     print(f"[paper] settled={n_closed} free={free:.2f} locked={locked:.2f} pnl={pnl:.2f}")
                 last_settle_ts = now
 
-            # -------------------------
-            # refresh Kalshi universe (isolated)
-            # -------------------------
             if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
                 try:
                     markets = list(
@@ -344,18 +341,40 @@ def main() -> int:
                             details=f"question={s.market.question}",
                         )
 
-                print(f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} cursor={cursor}/{len(kalshi_universe)}")
+                print(
+                    f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} "
+                    f"inserted=({_summarize_rows(rows)}) cursor={cursor}/{len(kalshi_universe)}"
+                )
 
             # -------------------------
             # B) Cross-venue mapping scan (+ optional paper execution)
             # -------------------------
             if args.use_mapping and resolved_mappings:
                 k_tickers = {m.kalshi_ticker for m in resolved_mappings}
-                provider_k = KalshiProvider(include_tickers=set(k_tickers))
+
+                # IMPORTANT: some versions of KalshiProvider may not accept include_tickers kwarg
+                try:
+                    provider_k = KalshiProvider(include_tickers=set(k_tickers))
+                except TypeError:
+                    provider_k = KalshiProvider()
+
                 snaps_k = list(provider_k.fetch_market_snapshots())
 
                 provider_p = PolymarketProvider(mappings=resolved_mappings)
                 snaps_p = list(provider_p.fetch_market_snapshots())
+
+                print(f"[daemon] mapping fetch: kalshi_snaps={len(snaps_k)} poly_snaps={len(snaps_p)}")
+
+                if len(snaps_p) == 0:
+                    # Print just enough to diagnose without 80 comandos
+                    sample = resolved_mappings[:3]
+                    print("[daemon] WARNING: PolymarketProvider returned 0 snapshots.")
+                    print("[daemon] sample mappings:")
+                    for mp in sample:
+                        print(
+                            f"  - slug={mp.polymarket_slug} yes_id={str(mp.polymarket_yes_token_id)[:10]}... "
+                            f"no_id={str(mp.polymarket_no_token_id)[:10]}..."
+                        )
 
                 ts = int(time.time())
                 rows: list[SnapshotRow] = []
@@ -374,6 +393,7 @@ def main() -> int:
                         )
                     )
                 store.insert_snapshots(rows)
+                print(f"[daemon] mapping inserted snapshots: {_summarize_rows(rows)}")
 
                 index_k = {s.market.market_id: s for s in snaps_k}
                 index_p = {s.market.market_id: s for s in snaps_p}
@@ -408,7 +428,10 @@ def main() -> int:
                                 details="BUY yes@kalshi + no@poly",
                             )
 
-                            print(f"[ALERT] cross_venue K_yes + P_no {mp.kalshi_ticker} <-> {mp.polymarket_slug} buf_edge={buf_edge:.4f} exe={exe:.2f}")
+                            print(
+                                f"[ALERT] cross_venue K_yes + P_no {mp.kalshi_ticker} <-> {mp.polymarket_slug} "
+                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                            )
 
                             if bot_enabled and bot_mode == "paper":
                                 key = f"KYES_PNO:{mp.kalshi_ticker}:{mp.polymarket_slug}"
@@ -458,7 +481,10 @@ def main() -> int:
                                 details="BUY yes@poly + no@kalshi",
                             )
 
-                            print(f"[ALERT] cross_venue P_yes + K_no {mp.polymarket_slug} <-> {mp.kalshi_ticker} buf_edge={buf_edge:.4f} exe={exe:.2f}")
+                            print(
+                                f"[ALERT] cross_venue P_yes + K_no {mp.polymarket_slug} <-> {mp.kalshi_ticker} "
+                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                            )
 
                             if bot_enabled and bot_mode == "paper":
                                 key = f"PYES_KNO:{mp.polymarket_slug}:{mp.kalshi_ticker}"
@@ -484,7 +510,10 @@ def main() -> int:
                                     else:
                                         print(f"[paper] SKIP {reason}")
 
-                print(f"[daemon] mapping tickers={len(resolved_mappings)} bot={bot_mode if bot_enabled else 'disabled'} min_buf_edge={min_buf_edge:.4f}")
+                print(
+                    f"[daemon] mapping tickers={len(resolved_mappings)} bot={bot_mode if bot_enabled else 'disabled'} "
+                    f"min_buf_edge={min_buf_edge:.4f}"
+                )
 
             backoff.reset()
             time.sleep(args.sleep_secs)
