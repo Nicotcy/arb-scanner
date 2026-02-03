@@ -25,6 +25,8 @@ import json
 import os
 import re
 import sys
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from difflib import SequenceMatcher
 from typing import Any
 
