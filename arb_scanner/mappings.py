@@ -1,39 +1,30 @@
-from __future__ import annotations
+# arb_scanner/mappings.py
 
-from dataclasses import dataclass
+import json
+import os
+from typing import List, Optional
 
+# ... aquí arriba ya tienes MarketMapping definido
 
-@dataclass(frozen=True)
-class MarketMapping:
-    kalshi_ticker: str
-    polymarket_slug: str
-    polymarket_yes_token_id: str | None = None
-    polymarket_no_token_id: str | None = None
+def load_manual_mappings(mode: str | None = None, path: str = ".data/mappings.json") -> list["MarketMapping"]:
+    """
+    Load manual mappings from JSON file if present.
+    Fallback to built-in defaults only if file is missing.
+    """
 
+    if os.path.exists(path):
+        raw = json.load(open(path, "r"))
+        out: list[MarketMapping] = []
+        for x in raw:
+            out.append(MarketMapping(
+                kalshi_ticker=x.get("kalshi_ticker"),
+                polymarket_slug=x.get("polymarket_slug"),
+                polymarket_yes_token_id=x.get("polymarket_yes_token_id"),
+                polymarket_no_token_id=x.get("polymarket_no_token_id"),
+            ))
+        return out
 
-# Two explicit buckets.
-# SAFE should only contain pairs you've verified have aligned resolution rules.
-# LAB can contain "looks equivalent" pairs you want to explore in paper.
-SAFE_MAPPINGS: list[MarketMapping] = [
-    # put SAFE pairs here
-]
-
-LAB_MAPPINGS: list[MarketMapping] = [
-    # example bootstrap LAB (remove/replace as you validate):
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-LK", polymarket_slug="will-trump-nominate-larry-kudlow-as-the-next-fed-chair"),
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-BPUL", polymarket_slug="will-trump-nominate-bill-pulte-as-the-next-fed-chair"),
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-AL", polymarket_slug="will-trump-nominate-arthur-laffer-as-the-next-fed-chair"),
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-RP", polymarket_slug="will-trump-nominate-ron-paul-as-the-next-fed-chair"),
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-HLUT", polymarket_slug="will-trump-nominate-howard-lutnick-as-the-next-fed-chair"),
-    MarketMapping(kalshi_ticker="KXFEDCHAIRNOM-29-DMAL", polymarket_slug="will-trump-nominate-david-malpass-as-the-next-fed-chair"),
-]
-
-# Backwards-compatible alias:
-MANUAL_MAPPINGS: list[MarketMapping] = SAFE_MAPPINGS + LAB_MAPPINGS
-
-
-def load_manual_mappings(mode: str | None = None) -> list[MarketMapping]:
-    # mode: "safe" -> SAFE only, otherwise SAFE+LAB
-    if mode == "safe":
-        return list(SAFE_MAPPINGS)
-    return list(MANUAL_MAPPINGS)
+    # --- Fallback: antiguos defaults internos (lo que tengas ahora) ---
+    # deja aquí el código que ya tenías para mode->defaults
+    # por ejemplo: return DEFAULTS_BY_MODE[mode] ...
+    return _load_builtin_defaults(mode)
