@@ -117,7 +117,7 @@ class PolymarketPublicClient:
                 raise
 
             except URLError:
-                # DNS / connection failures -> fail fast.
+                # DNS / connection failures -> bubble up (daemon handles backoff)
                 raise
 
             except Exception as e:
@@ -169,6 +169,30 @@ class PolymarketPublicClient:
             return [s]
         return []
 
+    @staticmethod
+    def _parse_outcomes(value: Any) -> list[str]:
+        """Gamma sometimes returns outcomes as JSON-string or list."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(x) for x in value]
+        if isinstance(value, str):
+            s = value.strip()
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except Exception:
+                pass
+        return []
+
+    @classmethod
+    def _is_binary_yes_no_market(cls, gamma_market: dict) -> bool:
+        outs = cls._parse_outcomes(gamma_market.get("outcomes"))
+        norm = [o.strip().lower() for o in outs if isinstance(o, str)]
+        # Strict: must be exactly 2 outcomes and must be yes/no (order doesn't matter).
+        return len(norm) == 2 and set(norm) == {"yes", "no"}
+
     def gamma_get_market_by_slug(self, slug: str) -> dict | None:
         slug_enc = urllib.parse.quote(slug, safe="")
         url = f"{GAMMA_HOST}/markets/slug/{slug_enc}"
@@ -178,12 +202,30 @@ class PolymarketPublicClient:
         return None
 
     def resolve_slug_to_yes_no_token_ids(self, slug: str) -> tuple[str, str] | None:
+        """Resolve Gamma slug -> (YES_token_id, NO_token_id) only if the market is truly binary.
+
+        Safety behavior:
+          - if market is not strictly Yes/No binary -> return None
+          - if market is closed/inactive (when flags exist) -> return None
+        """
         m = self.gamma_get_market_by_slug(slug)
         if not m:
+            return None
+
+        # If Gamma gives obvious activity flags, respect them.
+        if m.get("closed") is True:
+            return None
+        if m.get("active") is False:
+            return None
+
+        if not self._is_binary_yes_no_market(m):
             return None
 
         token_ids = self._parse_clob_token_ids(m.get("clobTokenIds"))
         if len(token_ids) < 2:
             return None
 
+        # There isn't always a guaranteed ordering in clobTokenIds, but in practice
+        # for Yes/No markets Gamma returns [YES, NO]. If this ever flips, we will
+        # detect it later via price sanity checks (YES ask + NO ask should be ~1).
         return (token_ids[0], token_ids[1])
