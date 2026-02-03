@@ -7,8 +7,8 @@ import random
 import time
 import traceback
 import uuid
-from dataclasses import asdict
-from typing import Iterable
+
+import requests
 
 from arb_scanner.config import apply_mode, load_config
 from arb_scanner.kalshi_public import KalshiPublicClient
@@ -56,24 +56,14 @@ def parse_args() -> argparse.Namespace:
         help="SQLite path for snapshots + signals.",
     )
 
-    # Signal thresholds (internal Kalshi near-miss)
     p.add_argument("--internal-floor", type=float, default=float(os.getenv("INTERNAL_FLOOR", "-0.02")))
     p.add_argument("--internal-ceiling", type=float, default=float(os.getenv("INTERNAL_CEILING", "0.02")))
-
-    # Cross-venue alert threshold (edge after buffer)
     p.add_argument("--alert-threshold", type=float, default=float(os.getenv("ALERT_THRESHOLD", "0.02")))
 
     return p.parse_args()
 
 
 class Backoff:
-    """
-    Simple exponential backoff with jitter.
-    - base: initial delay (seconds)
-    - factor: multiplicative growth
-    - cap: max delay (seconds)
-    - jitter: +/- percentage randomization (0.2 => +/-20%)
-    """
     def __init__(self, base: float = 30.0, factor: float = 2.0, cap: float = 600.0, jitter: float = 0.20):
         self.base = float(base)
         self.factor = float(factor)
@@ -149,6 +139,14 @@ def resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMappi
     return out
 
 
+def _is_networkish(e: Exception) -> bool:
+    if isinstance(e, requests.RequestException):
+        return True
+    if isinstance(e, OSError):
+        return True
+    return False
+
+
 def main() -> int:
     args = parse_args()
 
@@ -163,20 +161,16 @@ def main() -> int:
     store = Storage(args.db_path)
     store.start_run(run_id, config.mode, notes=f"use_kalshi={args.use_kalshi} use_mapping={args.use_mapping}")
 
-    # Backoff for network-ish failures
     backoff = Backoff(
         base=float(os.getenv("NET_BACKOFF_BASE", "30")),
         cap=float(os.getenv("NET_BACKOFF_CAP", "600")),
     )
 
-    # 1) Build initial universe list (Kalshi)
     kalshi_client = KalshiPublicClient()
     last_refresh = 0
     kalshi_universe: list[str] = []
-
     cursor = load_cursor(args.state_path)
 
-    # 2) If using mappings, resolve Poly tokens once at startup (you can refresh later if you want)
     resolved_mappings: list[MarketMapping] = []
     if args.use_mapping:
         mappings = load_manual_mappings()
@@ -191,35 +185,42 @@ def main() -> int:
             raise SystemExit(2)
         resolved_mappings = resolved
 
-    # 3) Main loop
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
+
     while True:
         try:
             now = int(time.time())
 
-            # Refresh universe list periodically
             if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
-                markets = list(
-                    kalshi_client.list_open_markets(
-                        max_pages=int(os.getenv("KALSHI_PAGES", "200")),
-                        limit_per_page=int(os.getenv("KALSHI_LIMIT", "200")),
+                try:
+                    markets = list(
+                        kalshi_client.list_open_markets(
+                            max_pages=int(os.getenv("KALSHI_PAGES", "200")),
+                            limit_per_page=int(os.getenv("KALSHI_LIMIT", "200")),
+                        )
                     )
-                )
-                kalshi_universe = [m.get("ticker") for m in markets if m.get("ticker")]
-                kalshi_universe.sort()
-                last_refresh = now
-                print(f"[daemon] refreshed kalshi universe: {len(kalshi_universe)} tickers")
+                    kalshi_universe = [m.get("ticker") for m in markets if m.get("ticker")]
+                    kalshi_universe.sort()
+                    last_refresh = now
+                    print(f"[daemon] refreshed kalshi universe: {len(kalshi_universe)} tickers")
+                except Exception as e:
+                    if kalshi_universe:
+                        last_refresh = now
+                        tag = "net" if _is_networkish(e) else "err"
+                        print(
+                            f"[daemon] WARN[{tag}] kalshi universe refresh failed; using cached universe "
+                            f"(n={len(kalshi_universe)}): {type(e).__name__}: {e}"
+                        )
+                    else:
+                        raise
 
-            # A) Kalshi internal scan (batch)
             if args.use_kalshi and kalshi_universe:
                 batch, cursor = iter_batches(kalshi_universe, cursor, args.batch_size)
                 save_cursor(args.state_path, cursor)
 
-                # Use KalshiProvider but only for include_tickers=batch (no full scan)
                 try:
-                    provider = KalshiProvider(include_tickers=set(batch))  # your current provider supports this
+                    provider = KalshiProvider(include_tickers=set(batch))
                 except TypeError:
-                    # fallback if signature differs
                     provider = KalshiProvider()
 
                 snapshots = list(provider.fetch_market_snapshots())
@@ -242,7 +243,6 @@ def main() -> int:
                     )
                 store.insert_snapshots(rows)
 
-                # Internal “near-miss” signal = tightness (sum close to 1) with fee buffer info
                 for s in snapshots:
                     ya = s.orderbook.best_yes_price
                     na = s.orderbook.best_no_price
@@ -273,9 +273,7 @@ def main() -> int:
                     f"cursor={cursor}/{len(kalshi_universe)}"
                 )
 
-            # B) Cross-venue mapping scan (fast, every loop)
             if args.use_mapping and resolved_mappings:
-                # Kalshi tickers from mappings
                 k_tickers = {m.kalshi_ticker for m in resolved_mappings}
                 provider_k = KalshiProvider(include_tickers=set(k_tickers))
                 snaps_k = list(provider_k.fetch_market_snapshots())
@@ -284,7 +282,6 @@ def main() -> int:
                 snaps_p = list(provider_p.fetch_market_snapshots())
 
                 ts = int(time.time())
-                # Persist snapshots (optional; useful for analysis)
                 rows = []
                 for s in snaps_k + snaps_p:
                     rows.append(
@@ -302,10 +299,8 @@ def main() -> int:
                     )
                 store.insert_snapshots(rows)
 
-                # Compute cross-venue opportunities ourselves (simple, robust)
-                # For each mapping: consider both directions (Kalshi YES + Poly NO) and (Poly YES + Kalshi NO).
                 index_k = {s.market.market_id: s for s in snaps_k}
-                index_p = {s.market.market_id: s for s in snaps_p}  # PolymarketProvider probably sets market_id=slug
+                index_p = {s.market.market_id: s for s in snaps_p}
 
                 for mp in resolved_mappings:
                     ks = index_k.get(mp.kalshi_ticker)
@@ -313,7 +308,6 @@ def main() -> int:
                     if not ks or not ps:
                         continue
 
-                    # Direction 1: buy YES on Kalshi, buy NO on Poly
                     k_yes = ks.orderbook.best_yes_price
                     p_no = ps.orderbook.best_no_price
                     if k_yes is not None and p_no is not None:
@@ -340,7 +334,6 @@ def main() -> int:
                                 f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
                             )
 
-                    # Direction 2: buy YES on Poly, buy NO on Kalshi
                     p_yes = ps.orderbook.best_yes_price
                     k_no = ks.orderbook.best_no_price
                     if p_yes is not None and k_no is not None:
@@ -369,9 +362,7 @@ def main() -> int:
 
                 print(f"[daemon] mapping tickers={len(resolved_mappings)}")
 
-            # Si hemos llegado aquí sin excepciones, la red está OK: reset backoff
             backoff.reset()
-
             time.sleep(args.sleep_secs)
 
         except KeyboardInterrupt:
@@ -379,8 +370,8 @@ def main() -> int:
             break
 
         except Exception as e:
-            # Error típico: DNS/Wi-Fi/timeout/servicio caído
-            print(f"[daemon] ERROR: {type(e).__name__}: {e}")
+            tag = "net" if _is_networkish(e) else "err"
+            print(f"[daemon] ERROR[{tag}]: {type(e).__name__}: {e}")
             traceback.print_exc()
 
             s = backoff.next_sleep()
