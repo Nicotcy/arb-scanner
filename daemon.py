@@ -190,6 +190,19 @@ def main() -> int:
     while True:
         try:
             now = int(time.time())
+                        # --- DB retention / housekeeping (run rarely) ---
+            if not hasattr(main, "_last_prune_ts"):
+                main._last_prune_ts = 0  # type: ignore[attr-defined]
+
+            prune_every = int(os.getenv("PRUNE_EVERY_SECS", "1800"))  # 30 min
+            keep_days = int(os.getenv("SNAPSHOT_TTL_DAYS", "7"))
+
+            if keep_days > 0 and now - main._last_prune_ts >= prune_every:  # type: ignore[attr-defined]
+                deleted = store.prune_snapshots(keep_days=keep_days)
+                store.wal_checkpoint("TRUNCATE")
+                print(f"[daemon] pruned snapshots: deleted={deleted} keep_days={keep_days}")
+                main._last_prune_ts = now  # type: ignore[attr-defined]
+
 
             if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
                 try:
