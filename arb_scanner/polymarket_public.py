@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
@@ -27,20 +28,19 @@ class OrderBookSummary:
 
 
 class PolymarketPublicClient:
-    """
-    Read-only client for:
-      - Gamma: market metadata (slug -> market details including clobTokenIds)
-      - CLOB: orderbook (token_id -> bids/asks)
+    """Read-only client for Gamma + CLOB, tuned for daemon use.
 
-    Notes:
-      - Some environments hit SSL issues (CERTIFICATE_VERIFY_FAILED). We use certifi if installed.
-      - Some environments hit 403 on Gamma without "browser-like" headers. We add them.
-      - Gamma has a dedicated endpoint: GET /markets/slug/{slug} (preferred). :contentReference[oaicite:1]{index=1}
+    Env tuning:
+      - POLY_TIMEOUT_S      (default 12)
+      - POLY_HTTP_ATTEMPTS  (default 2)
+      - POLY_HTTP_DEBUG     (default 0)
+      - POLYMARKET_INSECURE_SSL=1 (not recommended, but exists)
     """
 
-    def __init__(self, timeout_s: float = 15.0, retry_429: int = 3) -> None:
-        self.timeout_s = timeout_s
-        self.retry_429 = retry_429
+    def __init__(self) -> None:
+        self.timeout_s = float(os.getenv("POLY_TIMEOUT_S", "12"))
+        self.http_attempts = int(os.getenv("POLY_HTTP_ATTEMPTS", "2"))
+        self.debug = os.getenv("POLY_HTTP_DEBUG", "0") == "1"
 
     def _ssl_context(self) -> ssl.SSLContext:
         if os.getenv("POLYMARKET_INSECURE_SSL", "0") == "1":
@@ -54,7 +54,6 @@ class PolymarketPublicClient:
             return ssl.create_default_context()
 
     def _default_headers(self) -> dict[str, str]:
-        # "Normal" browser-ish headers help avoid 403 from basic WAF rules
         return {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -68,26 +67,67 @@ class PolymarketPublicClient:
         }
 
     def _get_json(self, url: str) -> Any:
-        last_err: Exception | None = None
         ctx = self._ssl_context()
         headers = self._default_headers()
+        attempts = max(1, int(self.http_attempts))
 
-        for attempt in range(self.retry_429 + 1):
+        last_err: Exception | None = None
+
+        for attempt in range(attempts):
             try:
+                if self.debug:
+                    print(f"[poly_http] GET {url} attempt={attempt+1}/{attempts}")
+
                 req = urllib.request.Request(url, method="GET", headers=headers)
                 with urllib.request.urlopen(req, timeout=self.timeout_s, context=ctx) as resp:
                     status = getattr(resp, "status", 200)
                     body = resp.read().decode("utf-8")
 
                 if status == 429:
-                    time.sleep(0.6 * (attempt + 1))
+                    sleep_s = 0.6 * (attempt + 1)
+                    if self.debug:
+                        print(f"[poly_http] 429 rate limit; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                    continue
+
+                if 500 <= int(status) < 600 and attempt < attempts - 1:
+                    sleep_s = 0.4 * (attempt + 1)
+                    if self.debug:
+                        print(f"[poly_http] {status} server error; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
                     continue
 
                 return json.loads(body)
 
+            except HTTPError as e:
+                last_err = e
+                code = getattr(e, "code", None)
+                if code == 429 and attempt < attempts - 1:
+                    sleep_s = 0.6 * (attempt + 1)
+                    if self.debug:
+                        print(f"[poly_http] 429 HTTPError; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                    continue
+                if code is not None and 500 <= int(code) < 600 and attempt < attempts - 1:
+                    sleep_s = 0.4 * (attempt + 1)
+                    if self.debug:
+                        print(f"[poly_http] {code} HTTPError; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                    continue
+                raise
+
+            except URLError:
+                # DNS / connection failures -> fail fast.
+                raise
+
             except Exception as e:
                 last_err = e
-                time.sleep(0.25 * (attempt + 1))
+                if attempt >= attempts - 1:
+                    raise
+                sleep_s = 0.25 * (attempt + 1)
+                if self.debug:
+                    print(f"[poly_http] exception={type(e).__name__}; sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
 
         raise RuntimeError(f"GET failed: {url} err={last_err}")
 
@@ -130,7 +170,6 @@ class PolymarketPublicClient:
         return []
 
     def gamma_get_market_by_slug(self, slug: str) -> dict | None:
-        # Preferred documented endpoint: /markets/slug/{slug} :contentReference[oaicite:2]{index=2}
         slug_enc = urllib.parse.quote(slug, safe="")
         url = f"{GAMMA_HOST}/markets/slug/{slug_enc}"
         data = self._get_json(url)
@@ -147,5 +186,4 @@ class PolymarketPublicClient:
         if len(token_ids) < 2:
             return None
 
-        # Convention is typically [YES, NO] for binary markets.
         return (token_ids[0], token_ids[1])
