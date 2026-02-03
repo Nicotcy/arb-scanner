@@ -1,35 +1,15 @@
 from __future__ import annotations
 
-"""Find likely Kalshi tickers for a list of Polymarket markets.
-
-Bootstrap workflow:
-  1) Generate a Polymarket shortlist (slug + question), e.g.:
-       python tools/poly_list_active.py --limit 200 --min-liquidity 2000 > /tmp/poly_active.json
-
-  2) Rank Kalshi candidates for each Polymarket question:
-       python tools/kalshi_find_candidates.py --poly-json /tmp/poly_active.json --top 8 --refresh-kalshi
-
-It will:
-  - Fetch & cache the current open Kalshi market list (ticker + text fields)
-  - For each Polymarket question, compute similarity scores vs Kalshi questions
-  - Print top-N candidates + optionally write JSON for review
-
-Design notes:
-  - Uses a simple, explainable score (SequenceMatcher + token Jaccard).
-  - Keeps caching on disk to avoid hammering Kalshi when you iterate.
-  - Does NOT attempt to "auto-map". Human validation stays in the loop.
-"""
-
 import argparse
 import json
 import os
 import re
 import sys
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from difflib import SequenceMatcher
 from typing import Any
 
+# Make imports work when running as: python3 tools/kalshi_find_candidates.py
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 RE_PUNCT = re.compile(r"[^a-z0-9\s]+", re.IGNORECASE)
 
@@ -44,8 +24,8 @@ def _norm(text: str) -> str:
 def _tokens(text: str) -> set[str]:
     t = _norm(text)
     stop = {
-        "will", "the", "a", "an", "to", "of", "in", "on", "for", "by", "and", "or",
-        "be", "is", "are", "was", "were", "at", "before", "after", "this", "that", "it", "as",
+        "will","the","a","an","to","of","in","on","for","by","and","or",
+        "be","is","are","was","were","at","before","after","this","that","it","as",
     }
     return {x for x in t.split(" ") if x and x not in stop and len(x) >= 3}
 
@@ -79,10 +59,9 @@ def load_poly_list(path: str) -> list[dict[str, Any]]:
             continue
         slug = (m.get("slug") or "").strip()
         q = (m.get("question") or "").strip()
-        outcomes = m.get("outcomes")
         if not slug or not q:
             continue
-        out.append({"slug": slug, "question": q, "outcomes": outcomes, "liquidityNum": m.get("liquidityNum")})
+        out.append({"slug": slug, "question": q, "liquidityNum": m.get("liquidityNum"), "outcomes": m.get("outcomes")})
     return out
 
 
@@ -129,21 +108,18 @@ def load_or_refresh_kalshi_cache(cache_path: str, refresh: bool, max_pages: int,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Rank Kalshi ticker candidates for Polymarket slugs (bootstrap mapping)")
-    ap.add_argument("--poly-json", default="/tmp/poly_active.json")
+    ap = argparse.ArgumentParser(description="Rank Kalshi tickers for Polymarket slugs (bootstrap mapping)")
+    ap.add_argument("--poly-json", default="/tmp/poly_active_safe.json")
     ap.add_argument("--kalshi-cache", default="/tmp/kalshi_open.json")
     ap.add_argument("--refresh-kalshi", action="store_true")
     ap.add_argument("--top", type=int, default=8)
     ap.add_argument("--max-poly", type=int, default=0)
-    ap.add_argument("--slug", default="")
     ap.add_argument("--out", default="/tmp/kalshi_candidates.json")
     ap.add_argument("--max-pages", type=int, default=int(os.getenv("KALSHI_CAND_MAX_PAGES", "6")))
     ap.add_argument("--limit-per-page", type=int, default=int(os.getenv("KALSHI_CAND_LIMIT", "200")))
     args = ap.parse_args()
 
     poly = load_poly_list(args.poly_json)
-    if args.slug:
-        poly = [m for m in poly if m.get("slug") == args.slug]
     if args.max_poly and args.max_poly > 0:
         poly = poly[: args.max_poly]
     if not poly:
@@ -159,7 +135,6 @@ def main() -> int:
         kal_texts.append({"ticker": t, "text": txt})
 
     results: list[dict[str, Any]] = []
-
     for i, pm in enumerate(poly, 1):
         slug = pm["slug"]
         pq = pm["question"]
@@ -170,7 +145,6 @@ def main() -> int:
             if s <= 0:
                 continue
             scored.append((s, km["ticker"], km["text"]))
-
         scored.sort(reverse=True, key=lambda x: x[0])
         top = scored[: max(1, args.top)]
 
@@ -183,24 +157,17 @@ def main() -> int:
 
         results.append(
             {
-                "polymarket": {
-                    "slug": slug,
-                    "question": pq,
-                    "liquidityNum": pm.get("liquidityNum"),
-                    "outcomes": pm.get("outcomes"),
-                },
+                "polymarket": pm,
                 "candidates": [{"score": float(s), "kalshi_ticker": t, "kalshi_text": txt} for (s, t, txt) in top],
             }
         )
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print("=" * 100)
-        print(f"Wrote: {args.out}")
-
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print("=" * 100)
+    print(f"Wrote: {args.out}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
