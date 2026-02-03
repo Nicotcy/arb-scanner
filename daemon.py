@@ -12,7 +12,8 @@ import requests
 
 from arb_scanner.config import apply_mode, load_config
 from arb_scanner.kalshi_public import KalshiPublicClient
-from arb_scanner.mappings import load_manual_mappings, MarketMapping
+from arb_scanner.mappings import MarketMapping, load_manual_mappings
+from arb_scanner.paper_executor import Leg, PaperConfig, PaperExecutor, TradePlan
 from arb_scanner.polymarket_public import PolymarketPublicClient
 from arb_scanner.sources.kalshi import KalshiProvider
 from arb_scanner.sources.polymarket import PolymarketProvider
@@ -20,7 +21,7 @@ from arb_scanner.storage import SnapshotRow, Storage
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="arb-scanner daemon loop (read-only, persistent, 24/7 style)")
+    p = argparse.ArgumentParser(description="arb-scanner daemon loop (read-only + optional paper execution)")
 
     p.add_argument("--mode", choices=["lab", "safe"], default=os.getenv("MODE", "lab"))
     p.add_argument("--use-kalshi", action="store_true", help="Scan Kalshi internal (batches over whole universe).")
@@ -45,16 +46,9 @@ def parse_args() -> argparse.Namespace:
         help="Sleep between iterations (controls request pressure).",
     )
 
-    p.add_argument(
-        "--state-path",
-        default=os.getenv("DAEMON_STATE_PATH", ".state/kalshi_cursor.json"),
-        help="Where to persist cursor across restarts.",
-    )
-    p.add_argument(
-        "--db-path",
-        default=os.getenv("DB_PATH", ".data/scan.db"),
-        help="SQLite path for snapshots + signals.",
-    )
+    p.add_argument("--state-path", default=os.getenv("DAEMON_STATE_PATH", ".state/kalshi_cursor.json"))
+    p.add_argument("--botctl-path", default=os.getenv("BOTCTL_STATE_PATH", ".state/botctl.json"))
+    p.add_argument("--db-path", default=os.getenv("DB_PATH", ".data/scan.db"))
 
     p.add_argument("--internal-floor", type=float, default=float(os.getenv("INTERNAL_FLOOR", "-0.02")))
     p.add_argument("--internal-ceiling", type=float, default=float(os.getenv("INTERNAL_CEILING", "0.02")))
@@ -117,6 +111,10 @@ def iter_batches(items: list[str], start: int, batch_size: int) -> tuple[list[st
 
 
 def resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMapping]:
+    """
+    Resolve slugs -> YES/NO token IDs via Gamma.
+    Note: PolymarketPublicClient now refuses non-binary markets (strict Yes/No).
+    """
     client = PolymarketPublicClient()
     out: list[MarketMapping] = []
     for mp in mappings:
@@ -140,11 +138,26 @@ def resolve_polymarket_tokens(mappings: list[MarketMapping]) -> list[MarketMappi
 
 
 def _is_networkish(e: Exception) -> bool:
-    if isinstance(e, requests.RequestException):
-        return True
-    if isinstance(e, OSError):
-        return True
-    return False
+    return isinstance(e, (requests.RequestException, OSError))
+
+
+def _read_botctl(path: str) -> dict:
+    """
+    Lightweight control plane:
+      - enabled: bool
+      - mode: 'off' | 'alerts' | 'paper'
+      - bankroll: float  (for paper init)
+      - max_per_trade: float  (max USD to lock per trade)
+      - min_buf_edge: float  (override threshold)
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            return {}
+        return st
+    except Exception:
+        return {}
 
 
 def main() -> int:
@@ -166,6 +179,20 @@ def main() -> int:
         cap=float(os.getenv("NET_BACKOFF_CAP", "600")),
     )
 
+    # Housekeeping knobs
+    prune_every = int(os.getenv("PRUNE_EVERY_SECS", "1800"))  # 30 min
+    keep_days = int(os.getenv("SNAPSHOT_TTL_DAYS", "7"))
+
+    settle_every = int(os.getenv("PAPER_SETTLE_EVERY_SECS", "30"))
+    paper_settle_after = int(os.getenv("PAPER_SETTLE_AFTER_SECS", "3600"))
+
+    trade_cooldown = int(os.getenv("TRADE_COOLDOWN_SECS", "120"))
+    last_trade_by_key: dict[str, int] = {}
+
+    # Initialize paper executor (it does nothing unless botctl enables it)
+    paper_cfg = PaperConfig(settle_after_secs=paper_settle_after)
+    paper = PaperExecutor(store, cfg=paper_cfg)
+
     kalshi_client = KalshiPublicClient()
     last_refresh = 0
     kalshi_universe: list[str] = []
@@ -176,10 +203,11 @@ def main() -> int:
         mappings = load_manual_mappings()
         if not mappings:
             raise SystemExit("No mappings defined in arb_scanner/mappings.py")
+
         resolved = resolve_polymarket_tokens(mappings)
         unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
         if unresolved:
-            print("Some mappings could not be resolved (Gamma). Fix these slugs:")
+            print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
             for m in unresolved:
                 print(f"  - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
             raise SystemExit(2)
@@ -187,23 +215,55 @@ def main() -> int:
 
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
 
+    last_prune_ts = 0
+    last_settle_ts = 0
+    last_botctl_ts = 0
+    botctl_cache: dict = {}
+
     while True:
         try:
             now = int(time.time())
-                        # --- DB retention / housekeeping (run rarely) ---
-            if not hasattr(main, "_last_prune_ts"):
-                main._last_prune_ts = 0  # type: ignore[attr-defined]
 
-            prune_every = int(os.getenv("PRUNE_EVERY_SECS", "1800"))  # 30 min
-            keep_days = int(os.getenv("SNAPSHOT_TTL_DAYS", "7"))
+            # -------------------------
+            # control-plane refresh
+            # -------------------------
+            if now - last_botctl_ts >= 2:
+                botctl_cache = _read_botctl(args.botctl_path)
+                last_botctl_ts = now
 
-            if keep_days > 0 and now - main._last_prune_ts >= prune_every:  # type: ignore[attr-defined]
+            bot_enabled = bool(botctl_cache.get("enabled", False))
+            bot_mode = str(botctl_cache.get("mode", "off"))
+            min_buf_edge = float(botctl_cache.get("min_buf_edge", args.alert_threshold))
+            max_per_trade = float(botctl_cache.get("max_per_trade", 50.0))
+            bankroll = float(botctl_cache.get("bankroll", 1000.0))
+
+            # Sync bankroll into paper engine once (if user changed it).
+            if store.paper_get("bankroll_set") != True:
+                # only set once on first boot unless you clear paper_state
+                store.paper_set("free_balance", bankroll)
+                store.paper_set("locked_balance", 0.0)
+                store.paper_set("realized_pnl", 0.0)
+                store.paper_set("bankroll_set", True)
+
+            # -------------------------
+            # housekeeping
+            # -------------------------
+            if keep_days > 0 and now - last_prune_ts >= prune_every:
                 deleted = store.prune_snapshots(keep_days=keep_days)
                 store.wal_checkpoint("TRUNCATE")
                 print(f"[daemon] pruned snapshots: deleted={deleted} keep_days={keep_days}")
-                main._last_prune_ts = now  # type: ignore[attr-defined]
+                last_prune_ts = now
 
+            if now - last_settle_ts >= settle_every:
+                n_closed = paper.maybe_settle()
+                if n_closed:
+                    free, locked, pnl = paper.balances()
+                    print(f"[paper] settled={n_closed} free={free:.2f} locked={locked:.2f} pnl={pnl:.2f}")
+                last_settle_ts = now
 
+            # -------------------------
+            # refresh Kalshi universe (isolated)
+            # -------------------------
             if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
                 try:
                     markets = list(
@@ -227,6 +287,9 @@ def main() -> int:
                     else:
                         raise
 
+            # -------------------------
+            # A) Kalshi internal scan
+            # -------------------------
             if args.use_kalshi and kalshi_universe:
                 batch, cursor = iter_batches(kalshi_universe, cursor, args.batch_size)
                 save_cursor(args.state_path, cursor)
@@ -281,11 +344,11 @@ def main() -> int:
                             details=f"question={s.market.question}",
                         )
 
-                print(
-                    f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} "
-                    f"cursor={cursor}/{len(kalshi_universe)}"
-                )
+                print(f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} cursor={cursor}/{len(kalshi_universe)}")
 
+            # -------------------------
+            # B) Cross-venue mapping scan (+ optional paper execution)
+            # -------------------------
             if args.use_mapping and resolved_mappings:
                 k_tickers = {m.kalshi_ticker for m in resolved_mappings}
                 provider_k = KalshiProvider(include_tickers=set(k_tickers))
@@ -295,7 +358,7 @@ def main() -> int:
                 snaps_p = list(provider_p.fetch_market_snapshots())
 
                 ts = int(time.time())
-                rows = []
+                rows: list[SnapshotRow] = []
                 for s in snaps_k + snaps_p:
                     rows.append(
                         SnapshotRow(
@@ -321,6 +384,7 @@ def main() -> int:
                     if not ks or not ps:
                         continue
 
+                    # Direction 1: buy YES on Kalshi + buy NO on Polymarket
                     k_yes = ks.orderbook.best_yes_price
                     p_no = ps.orderbook.best_no_price
                     if k_yes is not None and p_no is not None:
@@ -328,7 +392,8 @@ def main() -> int:
                         raw_edge = 1.0 - cost
                         buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
                         exe = min(float(ks.orderbook.best_yes_size or 0.0), float(ps.orderbook.best_no_size or 0.0))
-                        if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+
+                        if buf_edge >= min_buf_edge and exe >= config.min_executable_size:
                             store.insert_signal(
                                 ts=ts,
                                 kind="cross_venue",
@@ -342,11 +407,34 @@ def main() -> int:
                                 exec_size=exe,
                                 details="BUY yes@kalshi + no@poly",
                             )
-                            print(
-                                f"[ALERT] cross_venue {mp.kalshi_ticker} <-> {mp.polymarket_slug} "
-                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
-                            )
 
+                            print(f"[ALERT] cross_venue K_yes + P_no {mp.kalshi_ticker} <-> {mp.polymarket_slug} buf_edge={buf_edge:.4f} exe={exe:.2f}")
+
+                            if bot_enabled and bot_mode == "paper":
+                                key = f"KYES_PNO:{mp.kalshi_ticker}:{mp.polymarket_slug}"
+                                if now - last_trade_by_key.get(key, 0) >= trade_cooldown:
+                                    size_cap = max_per_trade / cost if cost > 0 else 0.0
+                                    size = max(config.min_executable_size, min(exe, size_cap))
+                                    plan = TradePlan(
+                                        kind="cross_venue",
+                                        buf_edge=buf_edge,
+                                        sum_price=cost,
+                                        size=float(size),
+                                        legs=(
+                                            Leg("Kalshi", mp.kalshi_ticker, "YES", "BUY", float(k_yes), float(ks.orderbook.best_yes_size or 0.0)),
+                                            Leg("Polymarket", mp.polymarket_slug, "NO", "BUY", float(p_no), float(ps.orderbook.best_no_size or 0.0)),
+                                        ),
+                                        details="paper: buy YES@kalshi + NO@poly",
+                                    )
+                                    ok, reason = paper.try_execute(plan)
+                                    if ok:
+                                        last_trade_by_key[key] = now
+                                        free, locked, pnl = paper.balances()
+                                        print(f"[paper] OK {reason} free={free:.2f} locked={locked:.2f} pnl={pnl:.2f}")
+                                    else:
+                                        print(f"[paper] SKIP {reason}")
+
+                    # Direction 2: buy YES on Polymarket + buy NO on Kalshi
                     p_yes = ps.orderbook.best_yes_price
                     k_no = ks.orderbook.best_no_price
                     if p_yes is not None and k_no is not None:
@@ -354,7 +442,8 @@ def main() -> int:
                         raw_edge = 1.0 - cost
                         buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
                         exe = min(float(ps.orderbook.best_yes_size or 0.0), float(ks.orderbook.best_no_size or 0.0))
-                        if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+
+                        if buf_edge >= min_buf_edge and exe >= config.min_executable_size:
                             store.insert_signal(
                                 ts=ts,
                                 kind="cross_venue",
@@ -368,12 +457,34 @@ def main() -> int:
                                 exec_size=exe,
                                 details="BUY yes@poly + no@kalshi",
                             )
-                            print(
-                                f"[ALERT] cross_venue {mp.polymarket_slug} <-> {mp.kalshi_ticker} "
-                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
-                            )
 
-                print(f"[daemon] mapping tickers={len(resolved_mappings)}")
+                            print(f"[ALERT] cross_venue P_yes + K_no {mp.polymarket_slug} <-> {mp.kalshi_ticker} buf_edge={buf_edge:.4f} exe={exe:.2f}")
+
+                            if bot_enabled and bot_mode == "paper":
+                                key = f"PYES_KNO:{mp.polymarket_slug}:{mp.kalshi_ticker}"
+                                if now - last_trade_by_key.get(key, 0) >= trade_cooldown:
+                                    size_cap = max_per_trade / cost if cost > 0 else 0.0
+                                    size = max(config.min_executable_size, min(exe, size_cap))
+                                    plan = TradePlan(
+                                        kind="cross_venue",
+                                        buf_edge=buf_edge,
+                                        sum_price=cost,
+                                        size=float(size),
+                                        legs=(
+                                            Leg("Polymarket", mp.polymarket_slug, "YES", "BUY", float(p_yes), float(ps.orderbook.best_yes_size or 0.0)),
+                                            Leg("Kalshi", mp.kalshi_ticker, "NO", "BUY", float(k_no), float(ks.orderbook.best_no_size or 0.0)),
+                                        ),
+                                        details="paper: buy YES@poly + NO@kalshi",
+                                    )
+                                    ok, reason = paper.try_execute(plan)
+                                    if ok:
+                                        last_trade_by_key[key] = now
+                                        free, locked, pnl = paper.balances()
+                                        print(f"[paper] OK {reason} free={free:.2f} locked={locked:.2f} pnl={pnl:.2f}")
+                                    else:
+                                        print(f"[paper] SKIP {reason}")
+
+                print(f"[daemon] mapping tickers={len(resolved_mappings)} bot={bot_mode if bot_enabled else 'disabled'} min_buf_edge={min_buf_edge:.4f}")
 
             backoff.reset()
             time.sleep(args.sleep_secs)
