@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import List
 
@@ -13,40 +14,35 @@ class MarketMapping:
     polymarket_no_token_id: str | None = None
 
 
-# Whitelist manual de mappings cross-venue
-# SOLO mercados que tú validas como semánticamente idénticos
+# Fallback hardcodeado (por si NO existe .data/mappings.json)
 MANUAL_MAPPINGS: List[MarketMapping] = [
-    # Ejemplos históricos / placeholder (puedes borrarlos si quieres)
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-LK",
-        polymarket_slug="will-trump-nominate-larry-kudlow-as-the-next-fed-chair",
-    ),
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-BPUL",
-        polymarket_slug="will-trump-nominate-bill-pulte-as-the-next-fed-chair",
-    ),
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-AL",
-        polymarket_slug="will-trump-nominate-arthur-laffer-as-the-next-fed-chair",
-    ),
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-HLUT",
-        polymarket_slug="will-trump-nominate-howard-lutnick-as-the-next-fed-chair",
-    ),
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-DMAL",
-        polymarket_slug="will-trump-nominate-david-malpass-as-the-next-fed-chair",
-    ),
-    MarketMapping(
-        kalshi_ticker="KXFEDCHAIRNOM-29-RP",
-        polymarket_slug="will-trump-nominate-ron-paul-as-the-next-fed-chair",
-    ),
+    # Puedes dejarlo vacío si quieres
 ]
+
+
+def _parse_mapping_item(x: dict) -> MarketMapping:
+    return MarketMapping(
+        kalshi_ticker=str(x["kalshi_ticker"]),
+        polymarket_slug=str(x["polymarket_slug"]),
+        polymarket_yes_token_id=(str(x["polymarket_yes_token_id"]) if x.get("polymarket_yes_token_id") else None),
+        polymarket_no_token_id=(str(x["polymarket_no_token_id"]) if x.get("polymarket_no_token_id") else None),
+    )
 
 
 def load_manual_mappings(mode: str | None = None) -> list[MarketMapping]:
     """
-    Devuelve los mappings manuales.
-    El parámetro `mode` existe solo por compatibilidad con scanner/daemon.
+    Fuente de mappings cross-venue.
+
+    Prioridad:
+      1) .data/mappings.json (si existe)
+      2) MANUAL_MAPPINGS (fallback)
     """
+    path = os.environ.get("ARB_MAPPINGS_PATH", ".data/mappings.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            raise ValueError(f"{path} debe ser una lista JSON de mappings")
+        return [_parse_mapping_item(item) for item in raw]
+
     return list(MANUAL_MAPPINGS)
