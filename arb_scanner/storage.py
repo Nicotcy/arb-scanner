@@ -9,6 +9,7 @@ from typing import Iterable
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS runs (
   run_id TEXT PRIMARY KEY,
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(venue, market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS signals (
   ts INTEGER NOT NULL,
@@ -64,11 +66,27 @@ class SnapshotRow:
 
 
 class Storage:
+    """
+    SQLite storage tuned for long-running daemons.
+
+    Features:
+      - WAL mode
+      - INSERT OR IGNORE snapshots (idempotent by PK)
+      - TTL pruning for snapshots (keep last N days)
+      - optional WAL checkpoint to avoid giant -wal files
+
+    Env tuning (optional):
+      - SQLITE_BUSY_TIMEOUT_MS (default 5000)
+    """
+
     def __init__(self, path: str) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+
         self.path = path
-        self.conn = sqlite3.connect(path)
-        self.conn.execute("PRAGMA foreign_keys = ON;")
+        self.conn = sqlite3.connect(path, timeout=5.0)
+        busy_ms = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+        self.conn.execute(f"PRAGMA busy_timeout = {busy_ms};")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
@@ -137,3 +155,38 @@ class Storage:
             ),
         )
         self.conn.commit()
+
+    def prune_snapshots(self, *, keep_days: int) -> int:
+        """
+        Delete old snapshots outside retention window.
+
+        Returns number of deleted rows (approx; SQLite rowcount is reliable for DELETE).
+        """
+        keep_days = int(keep_days)
+        if keep_days <= 0:
+            return 0
+
+        cutoff = int(time.time()) - keep_days * 86400
+
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM snapshots WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
+
+    def wal_checkpoint(self, mode: str = "TRUNCATE") -> None:
+        """
+        Help keep the -wal file under control. Safe to call occasionally.
+
+        mode: PASSIVE | FULL | RESTART | TRUNCATE
+        """
+        mode = (mode or "TRUNCATE").upper()
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            mode = "TRUNCATE"
+
+        # WAL checkpoint can fail if DB is very busy; keep it best-effort.
+        try:
+            self.conn.execute(f"PRAGMA wal_checkpoint({mode});")
+            self.conn.commit()
+        except Exception:
+            pass
