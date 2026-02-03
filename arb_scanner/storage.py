@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import json
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Any
 
 
 SCHEMA = """
@@ -49,6 +50,45 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+
+-- Paper trading state + logs (no real trading)
+CREATE TABLE IF NOT EXISTS paper_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+  trade_id TEXT PRIMARY KEY,
+  ts_open INTEGER NOT NULL,
+  ts_close INTEGER,
+  status TEXT NOT NULL,          -- 'open' | 'closed' | 'canceled'
+  kind TEXT NOT NULL,            -- 'cross_venue'
+  size REAL NOT NULL,
+  sum_price REAL NOT NULL,
+  buf_edge REAL NOT NULL,
+  expected_profit REAL NOT NULL,
+  legs_json TEXT NOT NULL,       -- JSON with legs
+  details TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_open ON paper_trades(status, ts_open);
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+  order_id TEXT PRIMARY KEY,
+  trade_id TEXT,
+  ts INTEGER NOT NULL,
+  venue TEXT NOT NULL,
+  market_id TEXT NOT NULL,
+  side TEXT NOT NULL,            -- 'YES' | 'NO'
+  action TEXT NOT NULL,          -- 'BUY' | 'SELL'
+  price REAL NOT NULL,
+  size REAL NOT NULL,
+  status TEXT NOT NULL,          -- 'filled' | 'rejected' | 'canceled'
+  filled_size REAL NOT NULL,
+  details TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_ts ON paper_orders(ts);
 """
 
 
@@ -74,6 +114,7 @@ class Storage:
       - INSERT OR IGNORE snapshots (idempotent by PK)
       - TTL pruning for snapshots (keep last N days)
       - optional WAL checkpoint to avoid giant -wal files
+      - paper-trading tables for safe simulation
 
     Env tuning (optional):
       - SQLITE_BUSY_TIMEOUT_MS (default 5000)
@@ -160,14 +201,13 @@ class Storage:
         """
         Delete old snapshots outside retention window.
 
-        Returns number of deleted rows (approx; SQLite rowcount is reliable for DELETE).
+        Returns number of deleted rows.
         """
         keep_days = int(keep_days)
         if keep_days <= 0:
             return 0
 
         cutoff = int(time.time()) - keep_days * 86400
-
         cur = self.conn.cursor()
         cur.execute("DELETE FROM snapshots WHERE ts < ?", (cutoff,))
         deleted = cur.rowcount
@@ -183,10 +223,124 @@ class Storage:
         mode = (mode or "TRUNCATE").upper()
         if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
             mode = "TRUNCATE"
-
-        # WAL checkpoint can fail if DB is very busy; keep it best-effort.
         try:
             self.conn.execute(f"PRAGMA wal_checkpoint({mode});")
             self.conn.commit()
         except Exception:
             pass
+
+    # -------------------------
+    # Paper trading helpers
+    # -------------------------
+
+    def paper_get(self, key: str, default: Any = None) -> Any:
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM paper_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default
+
+    def paper_set(self, key: str, value: Any) -> None:
+        payload = json.dumps(value)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paper_state(key, value) VALUES(?, ?)",
+            (key, payload),
+        )
+        self.conn.commit()
+
+    def paper_insert_trade(
+        self,
+        *,
+        trade_id: str,
+        ts_open: int,
+        kind: str,
+        size: float,
+        sum_price: float,
+        buf_edge: float,
+        expected_profit: float,
+        legs: dict,
+        status: str = "open",
+        details: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_trades(
+                trade_id, ts_open, ts_close, status, kind, size, sum_price, buf_edge, expected_profit, legs_json, details
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                trade_id,
+                ts_open,
+                None,
+                status,
+                kind,
+                float(size),
+                float(sum_price),
+                float(buf_edge),
+                float(expected_profit),
+                json.dumps(legs),
+                details,
+            ),
+        )
+        self.conn.commit()
+
+    def paper_close_trade(self, trade_id: str, ts_close: int, status: str = "closed") -> None:
+        self.conn.execute(
+            "UPDATE paper_trades SET ts_close = ?, status = ? WHERE trade_id = ?",
+            (int(ts_close), status, trade_id),
+        )
+        self.conn.commit()
+
+    def paper_insert_order(
+        self,
+        *,
+        order_id: str,
+        trade_id: str,
+        ts: int,
+        venue: str,
+        market_id: str,
+        side: str,
+        action: str,
+        price: float,
+        size: float,
+        status: str,
+        filled_size: float,
+        details: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_orders(
+                order_id, trade_id, ts, venue, market_id, side, action, price, size, status, filled_size, details
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                order_id,
+                trade_id,
+                int(ts),
+                venue,
+                market_id,
+                side,
+                action,
+                float(price),
+                float(size),
+                status,
+                float(filled_size),
+                details,
+            ),
+        )
+        self.conn.commit()
+
+    def paper_list_open_trades(self, limit: int = 1000) -> list[tuple[str, int, float, float, float]]:
+        """
+        Returns (trade_id, ts_open, size, sum_price, expected_profit)
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT trade_id, ts_open, size, sum_price, expected_profit FROM paper_trades WHERE status='open' ORDER BY ts_open ASC LIMIT ?",
+            (int(limit),),
+        )
+        return cur.fetchall()
