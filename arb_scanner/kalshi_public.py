@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Tuple
 
 import requests
 
@@ -44,8 +44,22 @@ class KalshiTopOfBook:
 
 
 class KalshiPublicClient:
+    """Minimal read-only client with *fast failure* on network issues.
+
+    Design choice:
+      - Let the outer daemon loop handle exponential backoff.
+      - Keep client-side retries small and focused (429 / occasional 5xx), so we don't "pause silently"
+        for 60-120 seconds when Wi-Fi/DNS breaks.
+
+    Tuning via env:
+      - KALSHI_CONNECT_TIMEOUT (default 3.0)
+      - KALSHI_READ_TIMEOUT    (default 12.0)
+      - KALSHI_HTTP_ATTEMPTS   (default 2)  # total attempts for 429/5xx
+      - KALSHI_HTTP_DEBUG      (default 0)  # 1 to print per-attempt debug
+    """
+
     def __init__(self) -> None:
-        self.base_url = os.getenv("KALSHI_BASE_URL", BASE_URL)
+        self.base_url = os.getenv("KALSHI_BASE_URL", BASE_URL).rstrip("/")
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -55,7 +69,15 @@ class KalshiPublicClient:
                 )
             }
         )
-        self.timeout = float(os.getenv("KALSHI_TIMEOUT", "15"))
+
+        # Use separate connect/read timeouts (tuple) so DNS/Wi-Fi failures surface quickly.
+        self.connect_timeout = float(os.getenv("KALSHI_CONNECT_TIMEOUT", "3"))
+        self.read_timeout = float(os.getenv("KALSHI_READ_TIMEOUT", "12"))
+        self.timeout: Tuple[float, float] = (self.connect_timeout, self.read_timeout)
+
+        # Small retry budget; outer daemon handles backoff.
+        self.http_attempts = int(os.getenv("KALSHI_HTTP_ATTEMPTS", "2"))
+        self.debug = os.getenv("KALSHI_HTTP_DEBUG", "0") == "1"
 
         # How to enumerate "open" tradeable markets:
         # - "events" is recommended (filters out lots of MVE junk for scanner purposes)
@@ -63,16 +85,7 @@ class KalshiPublicClient:
         self.market_list_source = os.getenv("KALSHI_MARKET_LIST_SOURCE", "events").strip().lower()
 
     def list_open_markets(self, max_pages: int = 3, limit_per_page: int = 200) -> Iterable[dict[str, Any]]:
-        """
-        Yields *market objects* (dicts) that are likely binary tradeable markets.
-
-        Default strategy: enumerate open EVENTS with nested markets and yield those markets.
-        This avoids the situation where /markets?status=open is dominated by MVE/combos.
-
-        Env override:
-          KALSHI_MARKET_LIST_SOURCE=markets  -> use /markets directly (legacy)
-          KALSHI_MARKET_LIST_SOURCE=events   -> use /events with nested markets (default)
-        """
+        """Yields market objects (dicts) likely to be binary tradeable markets."""
         if self.market_list_source == "markets":
             yield from self._list_open_markets_from_markets(max_pages=max_pages, limit_per_page=limit_per_page)
             return
@@ -93,7 +106,6 @@ class KalshiPublicClient:
                 ticker = (m.get("ticker") or "").strip()
                 if not ticker:
                     continue
-                # Filter obvious MVEs/combos by ticker prefix (conservative)
                 if ticker.upper().startswith("KXMVE"):
                     continue
                 yield m
@@ -130,7 +142,6 @@ class KalshiPublicClient:
                     ticker = (m.get("ticker") or "").strip()
                     if not ticker:
                         continue
-                    # Filter obvious MVEs/combos by ticker prefix (conservative)
                     if ticker.upper().startswith("KXMVE"):
                         continue
                     yield m
@@ -168,17 +179,6 @@ class KalshiPublicClient:
         return out
 
     def fetch_top_of_book(self, ticker: str) -> KalshiTopOfBook:
-        """
-        Returns top-of-book bid/ask in DOLLARS (0.00-1.00) plus quantities.
-
-        Uses depth=1 to minimize payload:
-        - best YES bid is payload['orderbook']['yes'][0][0] (in cents)
-        - best NO  bid is payload['orderbook']['no'][0][0] (in cents)
-
-        Derived asks:
-        - yes_ask_cents = 100 - no_bid_cents
-        - no_ask_cents  = 100 - yes_bid_cents
-        """
         payload = self.get_orderbook(ticker, depth=1)
         ob = payload.get("orderbook") if isinstance(payload, dict) else None
         if not isinstance(ob, dict):
@@ -220,21 +220,46 @@ class KalshiPublicClient:
         params: dict[str, Any] | None = None,
         raw_path: bool = False,
     ) -> dict[str, Any]:
+        # raw_path exists mainly because some call-sites include querystring already.
         url = f"{self.base_url}{path}" if raw_path else f"{self.base_url}{path}"
 
-        for attempt in range(5):
+        attempts = max(1, int(self.http_attempts))
+        last_exc: Exception | None = None
+
+        for attempt in range(attempts):
             try:
+                if self.debug:
+                    print(f"[kalshi_http] GET {path} attempt={attempt+1}/{attempts}")
                 resp = self.session.get(url, params=params if not raw_path else None, timeout=self.timeout)
+
+                # Small, focused retry handling.
                 if resp.status_code == 429:
-                    time.sleep(0.5 * (attempt + 1))
+                    sleep_s = 0.6 * (attempt + 1)
+                    if self.debug:
+                        print(f"[kalshi_http] 429 rate limit; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
                     continue
+
+                if 500 <= resp.status_code < 600 and attempt < attempts - 1:
+                    sleep_s = 0.4 * (attempt + 1)
+                    if self.debug:
+                        print(f"[kalshi_http] {resp.status_code} server error; sleeping {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                    continue
+
                 resp.raise_for_status()
                 return resp.json()
-            except requests.RequestException:
-                if attempt == 4:
+
+            except requests.RequestException as e:
+                last_exc = e
+                if attempt >= attempts - 1:
                     raise
-                time.sleep(0.5 * (attempt + 1))
-        raise RuntimeError("unreachable")
+                sleep_s = 0.25 * (attempt + 1)
+                if self.debug:
+                    print(f"[kalshi_http] exception={type(e).__name__}; sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
+
+        raise RuntimeError(f"Kalshi GET failed after {attempts} attempts: {last_exc}")
 
 
 def _best_bid_from_levels(levels: Any) -> tuple[int | None, float | None]:
