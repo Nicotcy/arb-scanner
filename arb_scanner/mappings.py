@@ -11,17 +11,35 @@ class MarketMapping:
     polymarket_no_token_id: str | None = None
 
 
-# Mantén esto como tu "whitelist" cross-venue.
-# Regla: solo pares que tú hayas validado como equivalentes.
+# Whitelist cross-venue.
+# IMPORTANTE:
+# - Estos mappings NO son "SAFE definitivo", son válidos para bootstrap (LAB).
+# - Todos son 1:1 por texto y sirven para probar el pipeline cross_venue.
 MANUAL_MAPPINGS: list[MarketMapping] = [
-    # Ejemplo (este es malo para arbitraje, pero sirve como prueba técnica)
     MarketMapping(
-        kalshi_ticker="KXSB-26-SEA",
-        polymarket_slug="will-the-seattle-seahawks-win-super-bowl-2026",
+        kalshi_ticker="KXFEDCHAIRNOM-29-LK",
+        polymarket_slug="will-trump-nominate-larry-kudlow-as-the-next-fed-chair",
     ),
-
-    # Añade aquí más, por ejemplo:
-    # MarketMapping(kalshi_ticker="KXXXX-...", polymarket_slug="some-polymarket-slug"),
+    MarketMapping(
+        kalshi_ticker="KXFEDCHAIRNOM-29-BPUL",
+        polymarket_slug="will-trump-nominate-bill-pulte-as-the-next-fed-chair",
+    ),
+    MarketMapping(
+        kalshi_ticker="KXFEDCHAIRNOM-29-AL",
+        polymarket_slug="will-trump-nominate-arthur-laffer-as-the-next-fed-chair",
+    ),
+    MarketMapping(
+        kalshi_ticker="KXFEDCHAIRNOM-29-RP",
+        polymarket_slug="will-trump-nominate-ron-paul-as-the-next-fed-chair",
+    ),
+    MarketMapping(
+        kalshi_ticker="KXFEDCHAIRNOM-29-HLUT",
+        polymarket_slug="will-trump-nominate-howard-lutnick-as-the-next-fed-chair",
+    ),
+    MarketMapping(
+        kalshi_ticker="KXFEDCHAIRNOM-29-DMAL",
+        polymarket_slug="will-trump-nominate-david-malpass-as-the-next-fed-chair",
+    ),
 ]
 
 
