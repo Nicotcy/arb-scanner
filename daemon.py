@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
+import traceback
 import uuid
 from dataclasses import asdict
 from typing import Iterable
@@ -62,6 +64,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alert-threshold", type=float, default=float(os.getenv("ALERT_THRESHOLD", "0.02")))
 
     return p.parse_args()
+
+
+class Backoff:
+    """
+    Simple exponential backoff with jitter.
+    - base: initial delay (seconds)
+    - factor: multiplicative growth
+    - cap: max delay (seconds)
+    - jitter: +/- percentage randomization (0.2 => +/-20%)
+    """
+    def __init__(self, base: float = 30.0, factor: float = 2.0, cap: float = 600.0, jitter: float = 0.20):
+        self.base = float(base)
+        self.factor = float(factor)
+        self.cap = float(cap)
+        self.jitter = float(jitter)
+        self.attempt = 0
+
+    def reset(self) -> None:
+        self.attempt = 0
+
+    def next_sleep(self) -> float:
+        delay = min(self.cap, self.base * (self.factor ** self.attempt))
+        self.attempt += 1
+        if self.jitter > 0:
+            wiggle = delay * self.jitter
+            delay = max(0.0, delay + random.uniform(-wiggle, +wiggle))
+        return delay
 
 
 def load_cursor(path: str) -> int:
@@ -134,6 +163,12 @@ def main() -> int:
     store = Storage(args.db_path)
     store.start_run(run_id, config.mode, notes=f"use_kalshi={args.use_kalshi} use_mapping={args.use_mapping}")
 
+    # Backoff for network-ish failures
+    backoff = Backoff(
+        base=float(os.getenv("NET_BACKOFF_BASE", "30")),
+        cap=float(os.getenv("NET_BACKOFF_CAP", "600")),
+    )
+
     # 1) Build initial universe list (Kalshi)
     kalshi_client = KalshiPublicClient()
     last_refresh = 0
@@ -159,177 +194,201 @@ def main() -> int:
     # 3) Main loop
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
     while True:
-        now = int(time.time())
+        try:
+            now = int(time.time())
 
-        # Refresh universe list periodically
-        if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
-            markets = list(kalshi_client.list_open_markets(max_pages=int(os.getenv("KALSHI_PAGES", "200")),
-                                                          limit_per_page=int(os.getenv("KALSHI_LIMIT", "200"))))
-            kalshi_universe = [m.get("ticker") for m in markets if m.get("ticker")]
-            kalshi_universe.sort()
-            last_refresh = now
-            print(f"[daemon] refreshed kalshi universe: {len(kalshi_universe)} tickers")
-
-        # A) Kalshi internal scan (batch)
-        if args.use_kalshi and kalshi_universe:
-            batch, cursor = iter_batches(kalshi_universe, cursor, args.batch_size)
-            save_cursor(args.state_path, cursor)
-
-            # Use KalshiProvider but only for include_tickers=batch (no full scan)
-            try:
-                provider = KalshiProvider(include_tickers=set(batch))  # your current provider supports this
-            except TypeError:
-                # fallback if signature differs
-                provider = KalshiProvider()
-
-            snapshots = list(provider.fetch_market_snapshots())
-            ts = int(time.time())
-
-            rows: list[SnapshotRow] = []
-            for s in snapshots:
-                rows.append(
-                    SnapshotRow(
-                        ts=ts,
-                        venue=s.market.venue,
-                        market_id=s.market.market_id,
-                        question=s.market.question,
-                        yes_ask=s.orderbook.best_yes_price,
-                        no_ask=s.orderbook.best_no_price,
-                        yes_sz=float(s.orderbook.best_yes_size or 0.0),
-                        no_sz=float(s.orderbook.best_no_size or 0.0),
-                        raw=None,
+            # Refresh universe list periodically
+            if args.use_kalshi and (now - last_refresh >= args.refresh_markets_secs or not kalshi_universe):
+                markets = list(
+                    kalshi_client.list_open_markets(
+                        max_pages=int(os.getenv("KALSHI_PAGES", "200")),
+                        limit_per_page=int(os.getenv("KALSHI_LIMIT", "200")),
                     )
                 )
-            store.insert_snapshots(rows)
+                kalshi_universe = [m.get("ticker") for m in markets if m.get("ticker")]
+                kalshi_universe.sort()
+                last_refresh = now
+                print(f"[daemon] refreshed kalshi universe: {len(kalshi_universe)} tickers")
 
-            # Internal “near-miss” signal = tightness (sum close to 1) with fee buffer info
-            for s in snapshots:
-                ya = s.orderbook.best_yes_price
-                na = s.orderbook.best_no_price
-                if ya is None or na is None:
-                    continue
-                cost = float(ya) + float(na)
-                raw_edge = 1.0 - cost
-                buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
-                exe = min(float(s.orderbook.best_yes_size or 0.0), float(s.orderbook.best_no_size or 0.0))
+            # A) Kalshi internal scan (batch)
+            if args.use_kalshi and kalshi_universe:
+                batch, cursor = iter_batches(kalshi_universe, cursor, args.batch_size)
+                save_cursor(args.state_path, cursor)
 
-                if args.internal_floor <= buf_edge <= args.internal_ceiling:
-                    store.insert_signal(
-                        ts=ts,
-                        kind="kalshi_internal",
-                        a_venue="Kalshi",
-                        a_market_id=s.market.market_id,
-                        b_venue=None,
-                        b_market_id=None,
-                        sum_price=cost,
-                        raw_edge=raw_edge,
-                        buf_edge=buf_edge,
-                        exec_size=exe,
-                        details=f"question={s.market.question}",
+                # Use KalshiProvider but only for include_tickers=batch (no full scan)
+                try:
+                    provider = KalshiProvider(include_tickers=set(batch))  # your current provider supports this
+                except TypeError:
+                    # fallback if signature differs
+                    provider = KalshiProvider()
+
+                snapshots = list(provider.fetch_market_snapshots())
+                ts = int(time.time())
+
+                rows: list[SnapshotRow] = []
+                for s in snapshots:
+                    rows.append(
+                        SnapshotRow(
+                            ts=ts,
+                            venue=s.market.venue,
+                            market_id=s.market.market_id,
+                            question=s.market.question,
+                            yes_ask=s.orderbook.best_yes_price,
+                            no_ask=s.orderbook.best_no_price,
+                            yes_sz=float(s.orderbook.best_yes_size or 0.0),
+                            no_sz=float(s.orderbook.best_no_size or 0.0),
+                            raw=None,
+                        )
                     )
+                store.insert_snapshots(rows)
 
-            print(
-                f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} "
-                f"cursor={cursor}/{len(kalshi_universe)}"
-            )
-
-        # B) Cross-venue mapping scan (fast, every loop)
-        if args.use_mapping and resolved_mappings:
-            # Kalshi tickers from mappings
-            k_tickers = {m.kalshi_ticker for m in resolved_mappings}
-            provider_k = KalshiProvider(include_tickers=set(k_tickers))
-            snaps_k = list(provider_k.fetch_market_snapshots())
-
-            provider_p = PolymarketProvider(mappings=resolved_mappings)
-            snaps_p = list(provider_p.fetch_market_snapshots())
-
-            ts = int(time.time())
-            # Persist snapshots (optional; useful for analysis)
-            rows = []
-            for s in snaps_k + snaps_p:
-                rows.append(
-                    SnapshotRow(
-                        ts=ts,
-                        venue=s.market.venue,
-                        market_id=s.market.market_id,
-                        question=s.market.question,
-                        yes_ask=s.orderbook.best_yes_price,
-                        no_ask=s.orderbook.best_no_price,
-                        yes_sz=float(s.orderbook.best_yes_size or 0.0),
-                        no_sz=float(s.orderbook.best_no_size or 0.0),
-                        raw=None,
-                    )
-                )
-            store.insert_snapshots(rows)
-
-            # Compute cross-venue opportunities ourselves (simple, robust)
-            # For each mapping: consider both directions (Kalshi YES + Poly NO) and (Poly YES + Kalshi NO).
-            index_k = {s.market.market_id: s for s in snaps_k}
-            index_p = {s.market.market_id: s for s in snaps_p}  # PolymarketProvider probably sets market_id=slug
-
-            for mp in resolved_mappings:
-                ks = index_k.get(mp.kalshi_ticker)
-                ps = index_p.get(mp.polymarket_slug) or index_p.get(f"Poly:{mp.polymarket_slug}")
-                if not ks or not ps:
-                    continue
-
-                # Direction 1: buy YES on Kalshi, buy NO on Poly
-                k_yes = ks.orderbook.best_yes_price
-                p_no = ps.orderbook.best_no_price
-                if k_yes is not None and p_no is not None:
-                    cost = float(k_yes) + float(p_no)
+                # Internal “near-miss” signal = tightness (sum close to 1) with fee buffer info
+                for s in snapshots:
+                    ya = s.orderbook.best_yes_price
+                    na = s.orderbook.best_no_price
+                    if ya is None or na is None:
+                        continue
+                    cost = float(ya) + float(na)
                     raw_edge = 1.0 - cost
                     buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
-                    exe = min(float(ks.orderbook.best_yes_size or 0.0), float(ps.orderbook.best_no_size or 0.0))
-                    if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+                    exe = min(float(s.orderbook.best_yes_size or 0.0), float(s.orderbook.best_no_size or 0.0))
+
+                    if args.internal_floor <= buf_edge <= args.internal_ceiling:
                         store.insert_signal(
                             ts=ts,
-                            kind="cross_venue",
+                            kind="kalshi_internal",
                             a_venue="Kalshi",
-                            a_market_id=mp.kalshi_ticker,
-                            b_venue="Polymarket",
-                            b_market_id=mp.polymarket_slug,
+                            a_market_id=s.market.market_id,
+                            b_venue=None,
+                            b_market_id=None,
                             sum_price=cost,
                             raw_edge=raw_edge,
                             buf_edge=buf_edge,
                             exec_size=exe,
-                            details="BUY yes@kalshi + no@poly",
-                        )
-                        print(
-                            f"[ALERT] cross_venue {mp.kalshi_ticker} <-> {mp.polymarket_slug} "
-                            f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                            details=f"question={s.market.question}",
                         )
 
-                # Direction 2: buy YES on Poly, buy NO on Kalshi
-                p_yes = ps.orderbook.best_yes_price
-                k_no = ks.orderbook.best_no_price
-                if p_yes is not None and k_no is not None:
-                    cost = float(p_yes) + float(k_no)
-                    raw_edge = 1.0 - cost
-                    buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
-                    exe = min(float(ps.orderbook.best_yes_size or 0.0), float(ks.orderbook.best_no_size or 0.0))
-                    if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
-                        store.insert_signal(
+                print(
+                    f"[daemon] kalshi batch={len(batch)} snapshots={len(snapshots)} "
+                    f"cursor={cursor}/{len(kalshi_universe)}"
+                )
+
+            # B) Cross-venue mapping scan (fast, every loop)
+            if args.use_mapping and resolved_mappings:
+                # Kalshi tickers from mappings
+                k_tickers = {m.kalshi_ticker for m in resolved_mappings}
+                provider_k = KalshiProvider(include_tickers=set(k_tickers))
+                snaps_k = list(provider_k.fetch_market_snapshots())
+
+                provider_p = PolymarketProvider(mappings=resolved_mappings)
+                snaps_p = list(provider_p.fetch_market_snapshots())
+
+                ts = int(time.time())
+                # Persist snapshots (optional; useful for analysis)
+                rows = []
+                for s in snaps_k + snaps_p:
+                    rows.append(
+                        SnapshotRow(
                             ts=ts,
-                            kind="cross_venue",
-                            a_venue="Polymarket",
-                            a_market_id=mp.polymarket_slug,
-                            b_venue="Kalshi",
-                            b_market_id=mp.kalshi_ticker,
-                            sum_price=cost,
-                            raw_edge=raw_edge,
-                            buf_edge=buf_edge,
-                            exec_size=exe,
-                            details="BUY yes@poly + no@kalshi",
+                            venue=s.market.venue,
+                            market_id=s.market.market_id,
+                            question=s.market.question,
+                            yes_ask=s.orderbook.best_yes_price,
+                            no_ask=s.orderbook.best_no_price,
+                            yes_sz=float(s.orderbook.best_yes_size or 0.0),
+                            no_sz=float(s.orderbook.best_no_size or 0.0),
+                            raw=None,
                         )
-                        print(
-                            f"[ALERT] cross_venue {mp.polymarket_slug} <-> {mp.kalshi_ticker} "
-                            f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
-                        )
+                    )
+                store.insert_snapshots(rows)
 
-            print(f"[daemon] mapping tickers={len(resolved_mappings)}")
+                # Compute cross-venue opportunities ourselves (simple, robust)
+                # For each mapping: consider both directions (Kalshi YES + Poly NO) and (Poly YES + Kalshi NO).
+                index_k = {s.market.market_id: s for s in snaps_k}
+                index_p = {s.market.market_id: s for s in snaps_p}  # PolymarketProvider probably sets market_id=slug
 
-        time.sleep(args.sleep_secs)
+                for mp in resolved_mappings:
+                    ks = index_k.get(mp.kalshi_ticker)
+                    ps = index_p.get(mp.polymarket_slug) or index_p.get(f"Poly:{mp.polymarket_slug}")
+                    if not ks or not ps:
+                        continue
+
+                    # Direction 1: buy YES on Kalshi, buy NO on Poly
+                    k_yes = ks.orderbook.best_yes_price
+                    p_no = ps.orderbook.best_no_price
+                    if k_yes is not None and p_no is not None:
+                        cost = float(k_yes) + float(p_no)
+                        raw_edge = 1.0 - cost
+                        buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
+                        exe = min(float(ks.orderbook.best_yes_size or 0.0), float(ps.orderbook.best_no_size or 0.0))
+                        if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+                            store.insert_signal(
+                                ts=ts,
+                                kind="cross_venue",
+                                a_venue="Kalshi",
+                                a_market_id=mp.kalshi_ticker,
+                                b_venue="Polymarket",
+                                b_market_id=mp.polymarket_slug,
+                                sum_price=cost,
+                                raw_edge=raw_edge,
+                                buf_edge=buf_edge,
+                                exec_size=exe,
+                                details="BUY yes@kalshi + no@poly",
+                            )
+                            print(
+                                f"[ALERT] cross_venue {mp.kalshi_ticker} <-> {mp.polymarket_slug} "
+                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                            )
+
+                    # Direction 2: buy YES on Poly, buy NO on Kalshi
+                    p_yes = ps.orderbook.best_yes_price
+                    k_no = ks.orderbook.best_no_price
+                    if p_yes is not None and k_no is not None:
+                        cost = float(p_yes) + float(k_no)
+                        raw_edge = 1.0 - cost
+                        buf_edge = raw_edge - fee_buffer(cost, config.fee_buffer_bps)
+                        exe = min(float(ps.orderbook.best_yes_size or 0.0), float(ks.orderbook.best_no_size or 0.0))
+                        if buf_edge >= args.alert_threshold and exe >= config.min_executable_size:
+                            store.insert_signal(
+                                ts=ts,
+                                kind="cross_venue",
+                                a_venue="Polymarket",
+                                a_market_id=mp.polymarket_slug,
+                                b_venue="Kalshi",
+                                b_market_id=mp.kalshi_ticker,
+                                sum_price=cost,
+                                raw_edge=raw_edge,
+                                buf_edge=buf_edge,
+                                exec_size=exe,
+                                details="BUY yes@poly + no@kalshi",
+                            )
+                            print(
+                                f"[ALERT] cross_venue {mp.polymarket_slug} <-> {mp.kalshi_ticker} "
+                                f"buf_edge={buf_edge:.4f} exe={exe:.2f}"
+                            )
+
+                print(f"[daemon] mapping tickers={len(resolved_mappings)}")
+
+            # Si hemos llegado aquí sin excepciones, la red está OK: reset backoff
+            backoff.reset()
+
+            time.sleep(args.sleep_secs)
+
+        except KeyboardInterrupt:
+            print("\n[daemon] KeyboardInterrupt: exiting cleanly.")
+            break
+
+        except Exception as e:
+            # Error típico: DNS/Wi-Fi/timeout/servicio caído
+            print(f"[daemon] ERROR: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+            s = backoff.next_sleep()
+            print(f"[daemon] backoff sleeping {s:.1f}s then retry...")
+            time.sleep(s)
+            continue
+
+    return 0
 
 
 if __name__ == "__main__":
