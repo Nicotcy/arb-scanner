@@ -8,6 +8,18 @@ from typing import Any
 import requests
 
 
+def _normalize_outcomes(outcomes: Any) -> Any:
+    # Gamma sometimes returns outcomes as a JSON string like '["Yes","No"]'
+    if isinstance(outcomes, str):
+        s = outcomes.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                return json.loads(s)
+            except Exception:
+                return outcomes
+    return outcomes
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=50)
@@ -38,7 +50,7 @@ def main() -> int:
             continue
         slug = m.get("slug")
         q = m.get("question")
-        outcomes = m.get("outcomes")
+        outcomes = _normalize_outcomes(m.get("outcomes"))
         out.append(
             {
                 "slug": slug,
