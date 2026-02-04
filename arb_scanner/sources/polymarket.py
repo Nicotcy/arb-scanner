@@ -1,158 +1,131 @@
-cat > arb_scanner/sources/polymarket.py <<'PY'
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
-import time
-import requests
+from typing import Iterable
 
+from arb_scanner.mappings import MarketMapping
+from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
+from arb_scanner.polymarket_public import PolymarketPublicClient
+from arb_scanner.sources.base import MarketDataProvider
 
-# Snapshots “compatibles por atributos” con lo que usa daemon.py/scanner.py:
-# - s.market.venue / market_id / question
-# - s.orderbook.best_yes_price / best_no_price / best_yes_size / best_no_size
 
 @dataclass
-class Market:
-    venue: str
-    market_id: str
-    question: str
-
-@dataclass
-class OrderBook:
-    best_yes_price: Optional[float]
-    best_no_price: Optional[float]
-    best_yes_size: Optional[float]
-    best_no_size: Optional[float]
-
-@dataclass
-class Snapshot:
-    market: Market
-    orderbook: OrderBook
+class PolymarketStats:
+    total_mappings: int = 0
+    resolved: int = 0
+    missing_tokens: int = 0
+    book_errors: int = 0
+    noprices: int = 0
+    ok: int = 0
 
 
-class PolymarketProvider:
+class PolymarketProvider(MarketDataProvider):
     """
-    Read-only Polymarket provider using PUBLIC CLOB endpoints (no auth):
-      - GET https://clob.polymarket.com/price?token_id=...&side=buy
-      - GET https://clob.polymarket.com/book?token_id=...   (opcional, no hace falta para top-of-book)
-    Docs: https://docs.polymarket.com/quickstart/fetching-data
+    Read-only Polymarket provider using public CLOB + Gamma APIs.
+
+    Diseño consciente:
+    - No se escanea todo Polymarket.
+    - Solo se consultan los markets definidos en mappings.json.
+    - Esto es suficiente (y necesario) para arbitraje cross-venue.
     """
 
-    CLOB_BASE = "https://clob.polymarket.com"
-    GAMMA_BASE = "https://gamma-api.polymarket.com"
-
-    def __init__(self, mappings: list):
-        # mappings: lista de MarketMapping o dicts con:
-        # - polymarket_slug
-        # - polymarket_yes_token_id
-        # - polymarket_no_token_id
-        self.mappings = mappings
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": "arb-scanner/1.0 (read-only)"})
+    def __init__(self, mappings: list[MarketMapping]) -> None:
+        self.mappings = list(mappings)
+        self.client = PolymarketPublicClient()
+        self._question_cache: dict[str, str] = {}
 
     def name(self) -> str:
         return "Polymarket"
 
-    def _get_field(self, obj, key: str):
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
+    def _get_question_for_slug(self, slug: str) -> str:
+        if slug in self._question_cache:
+            return self._question_cache[slug]
 
-    def _gamma_question(self, slug: str) -> str:
-        # Mejor esfuerzo: si falla, devolvemos el slug como “question”
         try:
-            r = self.s.get(f"{self.GAMMA_BASE}/markets", params={"slug": slug}, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            # gamma /markets?slug=... normalmente devuelve lista
-            if isinstance(data, list) and data:
-                q = data[0].get("question") or data[0].get("title") or slug
-                return str(q)
-            if isinstance(data, dict):
-                q = data.get("question") or data.get("title") or slug
-                return str(q)
+            market = self.client.gamma_get_market_by_slug(slug)
         except Exception:
-            pass
-        return slug
+            market = None
 
-    def _clob_buy_price(self, token_id: str) -> tuple[Optional[float], Optional[float]]:
-        """
-        Devuelve (price, size) para comprar (side=buy).
-        Según docs, /price devuelve {"price":"0.65"}.
-        El tamaño no lo da /price; si quieres size real, usar /book.
-        """
+        question = None
+        if isinstance(market, dict):
+            question = (
+                market.get("question")
+                or market.get("title")
+                or market.get("name")
+            )
+
+        if not question:
+            question = slug
+
+        question = str(question)
+        self._question_cache[slug] = question
+        return question
+
+    def _resolve_tokens(self, mapping: MarketMapping) -> tuple[str, str] | None:
+        if mapping.polymarket_yes_token_id and mapping.polymarket_no_token_id:
+            return mapping.polymarket_yes_token_id, mapping.polymarket_no_token_id
+
         try:
-            r = self.s.get(f"{self.CLOB_BASE}/price", params={"token_id": token_id, "side": "buy"}, timeout=15)
-            r.raise_for_status()
-            j = r.json()
-            p = j.get("price")
-            if p is None:
-                return None, None
-            return float(p), None
+            return self.client.resolve_slug_to_yes_no_token_ids(
+                mapping.polymarket_slug
+            )
         except Exception:
-            return None, None
+            return None
 
-    def _clob_best_ask_and_size(self, token_id: str) -> tuple[Optional[float], Optional[float]]:
-        """
-        Lee el book y extrae el mejor ask (lo que pagas para comprar) y su size.
-        Si el book está vacío, devuelve (None, None).
-        """
-        try:
-            r = self.s.get(f"{self.CLOB_BASE}/book", params={"token_id": token_id}, timeout=15)
-            r.raise_for_status()
-            j = r.json()
-            asks = j.get("asks") or []
-            if not asks:
-                return None, None
-            # formato esperado: [{"price":"0.66","size":"300"}, ...]
-            best = asks[0]
-            return float(best.get("price")), float(best.get("size")) if best.get("size") is not None else None
-        except Exception:
-            return None, None
-
-    def fetch_market_snapshots(self) -> Iterable[Snapshot]:
-        out: List[Snapshot] = []
-
-        # cache simple para no machacar gamma si hay muchas iteraciones
-        question_cache: dict[str, str] = {}
+    def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
+        stats = PolymarketStats(total_mappings=len(self.mappings))
 
         for mp in self.mappings:
-            slug = str(self._get_field(mp, "polymarket_slug"))
-            yes_id = self._get_field(mp, "polymarket_yes_token_id")
-            no_id = self._get_field(mp, "polymarket_no_token_id")
-
-            if not slug or not yes_id or not no_id:
+            tokens = self._resolve_tokens(mp)
+            if not tokens:
+                stats.missing_tokens += 1
                 continue
 
-            yes_id = str(yes_id)
-            no_id = str(no_id)
+            yes_token, no_token = tokens
+            stats.resolved += 1
 
-            # pregunta (texto)
-            if slug not in question_cache:
-                question_cache[slug] = self._gamma_question(slug)
-            q = question_cache[slug]
+            try:
+                yes_book = self.client.get_order_book_summary(yes_token)
+                no_book = self.client.get_order_book_summary(no_token)
+            except Exception:
+                stats.book_errors += 1
+                continue
 
-            # Mejor ask real desde orderbook (si hay); si no hay, fallback a /price
-            yes_ask, yes_sz = self._clob_best_ask_and_size(yes_id)
-            no_ask, no_sz = self._clob_best_ask_and_size(no_id)
+            if yes_book.best_ask is None or no_book.best_ask is None:
+                stats.noprices += 1
+                continue
 
-            if yes_ask is None:
-                yes_ask, _ = self._clob_buy_price(yes_id)
-            if no_ask is None:
-                no_ask, _ = self._clob_buy_price(no_id)
+            yes_price = float(yes_book.best_ask.price)
+            no_price = float(no_book.best_ask.price)
+            yes_size = float(yes_book.best_ask.size)
+            no_size = float(no_book.best_ask.size)
 
-            # Ojo: aquí estamos guardando “ask para comprar YES” y “ask para comprar NO”
-            # El algoritmo luego hace sumas para arbitraje.
-            snap = Snapshot(
-                market=Market(venue="Polymarket", market_id=slug, question=q),
-                orderbook=OrderBook(
-                    best_yes_price=yes_ask,
-                    best_no_price=no_ask,
-                    best_yes_size=yes_sz,
-                    best_no_size=no_sz,
-                ),
+            orderbook = OrderBookTop(
+                best_yes_price=yes_price,
+                best_yes_size=yes_size,
+                best_no_price=no_price,
+                best_no_size=no_size,
             )
-            out.append(snap)
 
-        return out
-PY
+            market = Market(
+                venue="Polymarket",
+                market_id=mp.polymarket_slug,
+                question=self._get_question_for_slug(mp.polymarket_slug),
+                outcomes=("YES", "NO"),
+            )
+
+            stats.ok += 1
+            yield MarketSnapshot(
+                market=market,
+                orderbook=orderbook,
+            )
+
+        print(
+            "PolymarketProvider stats: "
+            f"mappings={stats.total_mappings} "
+            f"ok={stats.ok} "
+            f"resolved={stats.resolved} "
+            f"missing_tokens={stats.missing_tokens} "
+            f"book_errors={stats.book_errors} "
+            f"noprices={stats.noprices}"
+        )
