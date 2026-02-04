@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Any
 
+import json
 import requests
 
 from arb_scanner.mappings import MarketMapping
@@ -25,11 +26,16 @@ class PolymarketProvider(MarketDataProvider):
     Polymarket provider (READ-ONLY) usando SOLO Gamma API.
 
     Por qué:
-    - En tu entorno, los endpoints públicos del CLOB (/book, /price) devuelven 404 siempre.
-    - Gamma sí responde y trae outcomePrices / bestAsk / question, suficiente para snapshots y cross-venue.
+    - En tu entorno, CLOB (/book, /price) devuelve 404 siempre.
+    - Gamma sí responde y trae campos suficientes para un precio indicativo.
 
-    Limitación consciente:
-    - Esto NO es top-of-book real del CLOB. Lo tratamos como precio indicativo (size=0).
+    Precio (orden de preferencia):
+      1) outcomePrices (si viene, incluso si viene stringificado)
+      2) bestAsk (YES) => NO = 1 - YES
+      3) lastTradePrice (YES) => NO = 1 - YES
+
+    Size:
+      - No tenemos size real sin orderbook => size=0.0
     """
 
     GAMMA_URL = "https://gamma-api.polymarket.com/markets"
@@ -46,7 +52,6 @@ class PolymarketProvider(MarketDataProvider):
         return "Polymarket"
 
     def _gamma_get_market_by_slug(self, slug: str) -> dict[str, Any] | None:
-        # Gamma suele devolver lista de markets
         r = self.session.get(
             self.GAMMA_URL,
             params={"slug": slug, "limit": 10, "offset": 0},
@@ -62,7 +67,6 @@ class PolymarketProvider(MarketDataProvider):
             return data[0] if data else None
 
         if isinstance(data, dict):
-            # por si la API cambia y devuelve dict
             if data.get("slug") == slug:
                 return data
             for k in ("markets", "data", "results"):
@@ -71,42 +75,84 @@ class PolymarketProvider(MarketDataProvider):
                     for m in v:
                         if isinstance(m, dict) and m.get("slug") == slug:
                             return m
-                    return v[0] if v else None
+                    return v[0]
 
         return None
 
+    def _as_float(self, x: Any) -> float | None:
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
     def _extract_yes_no_prices(self, market: dict[str, Any]) -> tuple[float, float] | None:
-        """
-        Preferimos outcomePrices porque es binario y directo.
-        outcomes suele ser ["Yes","No"] y outcomePrices ["0.65","0.35"] (strings).
-        """
+        # 1) outcomePrices puede venir como lista o como string JSON
         outcomes = market.get("outcomes")
         prices = market.get("outcomePrices")
 
-        if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices) and len(prices) >= 2:
-            # mapeo por nombre si existe
+        if isinstance(prices, str):
+            s = prices.strip()
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    prices = json.loads(s)
+                except Exception:
+                    pass
+
+        if isinstance(outcomes, str):
+            s = outcomes.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    outcomes = json.loads(s)
+                except Exception:
+                    pass
+
+        # Caso A: outcomes=list y outcomePrices=list
+        if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) >= 2 and len(prices) == len(outcomes):
+            # mapeo por nombre si podemos
             name_to_price: dict[str, float] = {}
             for name, p in zip(outcomes, prices):
-                if name is None or p is None:
-                    continue
-                try:
-                    name_to_price[str(name).strip().upper()] = float(p)
-                except Exception:
-                    continue
+                key = str(name).strip().upper()
+                fp = self._as_float(p)
+                if fp is not None:
+                    name_to_price[key] = fp
 
-            y = name_to_price.get("YES")
-            n = name_to_price.get("NO")
+            y = name_to_price.get("YES") or name_to_price.get("YES ")  # por si acaso
+            n = name_to_price.get("NO")  or name_to_price.get("NO ")
             if y is not None and n is not None:
                 return y, n
 
             # fallback por orden típico (Yes, No)
-            try:
-                return float(prices[0]), float(prices[1])
-            except Exception:
-                return None
+            y = self._as_float(prices[0])
+            n = self._as_float(prices[1])
+            if y is not None and n is not None:
+                return y, n
 
-        # fallback: a veces hay bestAsk (pero suele ser único / no por outcome)
-        # Si bestAsk existe y spread existe, no podemos inferir NO de forma fiable → no lo usamos
+        # Caso B: prices como dict (por si Gamma cambia)
+        if isinstance(prices, dict):
+            # intentamos claves típicas
+            y = self._as_float(prices.get("YES") or prices.get("yes"))
+            n = self._as_float(prices.get("NO") or prices.get("no"))
+            if y is not None and n is not None:
+                return y, n
+
+        # 2) bestAsk como precio YES indicativo
+        best_ask = self._as_float(market.get("bestAsk"))
+        if best_ask is not None:
+            yes = best_ask
+            no = 1.0 - yes
+            if 0.0 <= yes <= 1.0 and 0.0 <= no <= 1.0:
+                return yes, no
+
+        # 3) lastTradePrice como precio YES indicativo
+        last = self._as_float(market.get("lastTradePrice"))
+        if last is not None:
+            yes = last
+            no = 1.0 - yes
+            if 0.0 <= yes <= 1.0 and 0.0 <= no <= 1.0:
+                return yes, no
+
         return None
 
     def _get_question_for_slug(self, slug: str, market: dict[str, Any] | None) -> str:
@@ -149,7 +195,7 @@ class PolymarketProvider(MarketDataProvider):
 
             ob = OrderBookTop(
                 best_yes_price=float(yes_price),
-                best_yes_size=0.0,  # Gamma no es orderbook: size desconocido
+                best_yes_size=0.0,
                 best_no_price=float(no_price),
                 best_no_size=0.0,
             )
