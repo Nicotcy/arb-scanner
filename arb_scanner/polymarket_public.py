@@ -1,231 +1,189 @@
 from __future__ import annotations
 
 import json
-import os
-import ssl
 import time
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
-from typing import Any
-from urllib.error import HTTPError, URLError
+from typing import Any, Optional
+from urllib.parse import quote
 
-CLOB_HOST = "https://clob.polymarket.com"
-GAMMA_HOST = "https://gamma-api.polymarket.com"
+import requests
 
 
-@dataclass(frozen=True)
+@dataclass
 class BookLevel:
     price: float
     size: float
 
 
-@dataclass(frozen=True)
-class OrderBookSummary:
-    token_id: str
-    best_bid: BookLevel | None
-    best_ask: BookLevel | None
+@dataclass
+class BookSummary:
+    best_ask: Optional[BookLevel]
 
 
 class PolymarketPublicClient:
-    """Read-only client for Gamma + CLOB, tuned for daemon use.
+    """
+    Cliente read-only para:
+      - Gamma API: descubrir markets/tokens
+      - CLOB API: order book
 
-    Env tuning:
-      - POLY_TIMEOUT_S      (default 12)
-      - POLY_HTTP_ATTEMPTS  (default 2)
-      - POLY_HTTP_DEBUG     (default 0)
-      - POLYMARKET_INSECURE_SSL=1 (not recommended, but exists)
+    Filosofía anti-caos:
+      - NO filtramos por active/closed aquí. Eso era una fuente enorme de "missing_tokens".
+      - Resolvemos tokens aunque el market esté cerrado. Si luego el book está vacío, lo verás como noprices.
+      - Damos errores explícitos en el debug/test (sin tragarnos excepciones silenciosamente).
     """
 
-    def __init__(self) -> None:
-        self.timeout_s = float(os.getenv("POLY_TIMEOUT_S", "12"))
-        self.http_attempts = int(os.getenv("POLY_HTTP_ATTEMPTS", "2"))
-        self.debug = os.getenv("POLY_HTTP_DEBUG", "0") == "1"
+    def __init__(self, timeout: float = 15.0) -> None:
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "arb-scanner/1.0 (read-only)",
+                "Accept": "application/json",
+            }
+        )
 
-    def _ssl_context(self) -> ssl.SSLContext:
-        if os.getenv("POLYMARKET_INSECURE_SSL", "0") == "1":
-            return ssl._create_unverified_context()
+    # ---------- HTTP helpers ----------
 
+    def _get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        r = self.session.get(url, params=params, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    # ---------- Gamma (markets) ----------
+
+    def gamma_get_market_by_slug(self, slug: str) -> dict[str, Any] | None:
+        """
+        Intenta varias estrategias:
+          1) /markets?slug=...
+          2) /markets?search=... y elegir exact match por slug
+        Devuelve dict market o None.
+        """
+        base = "https://gamma-api.polymarket.com/markets"
+
+        # 1) slug exact
         try:
-            import certifi  # type: ignore
-
-            return ssl.create_default_context(cafile=certifi.where())
+            data = self._get_json(base, params={"slug": slug, "limit": 10, "offset": 0})
+            market = self._pick_market_from_response(data, slug)
+            if market:
+                return market
         except Exception:
-            return ssl.create_default_context()
+            pass
 
-    def _default_headers(self) -> dict[str, str]:
-        return {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://polymarket.com/",
-            "Origin": "https://polymarket.com",
-        }
+        # 2) search fallback
+        try:
+            data = self._get_json(base, params={"search": slug, "limit": 50, "offset": 0})
+            market = self._pick_market_from_response(data, slug)
+            if market:
+                return market
+        except Exception:
+            pass
 
-    def _get_json(self, url: str) -> Any:
-        ctx = self._ssl_context()
-        headers = self._default_headers()
-        attempts = max(1, int(self.http_attempts))
-
-        last_err: Exception | None = None
-
-        for attempt in range(attempts):
-            try:
-                if self.debug:
-                    print(f"[poly_http] GET {url} attempt={attempt+1}/{attempts}")
-
-                req = urllib.request.Request(url, method="GET", headers=headers)
-                with urllib.request.urlopen(req, timeout=self.timeout_s, context=ctx) as resp:
-                    status = getattr(resp, "status", 200)
-                    body = resp.read().decode("utf-8")
-
-                if status == 429:
-                    sleep_s = 0.6 * (attempt + 1)
-                    if self.debug:
-                        print(f"[poly_http] 429 rate limit; sleeping {sleep_s:.1f}s")
-                    time.sleep(sleep_s)
-                    continue
-
-                if 500 <= int(status) < 600 and attempt < attempts - 1:
-                    sleep_s = 0.4 * (attempt + 1)
-                    if self.debug:
-                        print(f"[poly_http] {status} server error; sleeping {sleep_s:.1f}s")
-                    time.sleep(sleep_s)
-                    continue
-
-                return json.loads(body)
-
-            except HTTPError as e:
-                last_err = e
-                code = getattr(e, "code", None)
-                if code == 429 and attempt < attempts - 1:
-                    sleep_s = 0.6 * (attempt + 1)
-                    if self.debug:
-                        print(f"[poly_http] 429 HTTPError; sleeping {sleep_s:.1f}s")
-                    time.sleep(sleep_s)
-                    continue
-                if code is not None and 500 <= int(code) < 600 and attempt < attempts - 1:
-                    sleep_s = 0.4 * (attempt + 1)
-                    if self.debug:
-                        print(f"[poly_http] {code} HTTPError; sleeping {sleep_s:.1f}s")
-                    time.sleep(sleep_s)
-                    continue
-                raise
-
-            except URLError:
-                # DNS / connection failures -> bubble up (daemon handles backoff)
-                raise
-
-            except Exception as e:
-                last_err = e
-                if attempt >= attempts - 1:
-                    raise
-                sleep_s = 0.25 * (attempt + 1)
-                if self.debug:
-                    print(f"[poly_http] exception={type(e).__name__}; sleeping {sleep_s:.2f}s")
-                time.sleep(sleep_s)
-
-        raise RuntimeError(f"GET failed: {url} err={last_err}")
-
-    def get_order_book_summary(self, token_id: str) -> OrderBookSummary:
-        q = urllib.parse.urlencode({"token_id": token_id})
-        url = f"{CLOB_HOST}/book?{q}"
-        data = self._get_json(url)
-
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-
-        def _parse_level(level: dict) -> BookLevel | None:
-            try:
-                return BookLevel(price=float(level["price"]), size=float(level["size"]))
-            except Exception:
-                return None
-
-        best_bid = _parse_level(bids[0]) if bids else None
-        best_ask = _parse_level(asks[0]) if asks else None
-
-        return OrderBookSummary(token_id=token_id, best_bid=best_bid, best_ask=best_ask)
-
-    @staticmethod
-    def _parse_clob_token_ids(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(x) for x in value]
-        if isinstance(value, str):
-            s = value.strip()
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x) for x in parsed]
-            except Exception:
-                pass
-            if "," in s:
-                return [p.strip() for p in s.split(",") if p.strip()]
-            return [s]
-        return []
-
-    @staticmethod
-    def _parse_outcomes(value: Any) -> list[str]:
-        """Gamma sometimes returns outcomes as JSON-string or list."""
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(x) for x in value]
-        if isinstance(value, str):
-            s = value.strip()
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x) for x in parsed]
-            except Exception:
-                pass
-        return []
-
-    @classmethod
-    def _is_binary_yes_no_market(cls, gamma_market: dict) -> bool:
-        outs = cls._parse_outcomes(gamma_market.get("outcomes"))
-        norm = [o.strip().lower() for o in outs if isinstance(o, str)]
-        # Strict: must be exactly 2 outcomes and must be yes/no (order doesn't matter).
-        return len(norm) == 2 and set(norm) == {"yes", "no"}
-
-    def gamma_get_market_by_slug(self, slug: str) -> dict | None:
-        slug_enc = urllib.parse.quote(slug, safe="")
-        url = f"{GAMMA_HOST}/markets/slug/{slug_enc}"
-        data = self._get_json(url)
-        if isinstance(data, dict) and data.get("slug"):
-            return data
         return None
 
-    def resolve_slug_to_yes_no_token_ids(self, slug: str) -> tuple[str, str] | None:
-        """Resolve Gamma slug -> (YES_token_id, NO_token_id) only if the market is truly binary.
-
-        Safety behavior:
-          - if market is not strictly Yes/No binary -> return None
-          - if market is closed/inactive (when flags exist) -> return None
+    def _pick_market_from_response(self, data: Any, slug: str) -> dict[str, Any] | None:
         """
-        m = self.gamma_get_market_by_slug(slug)
-        if not m:
-            return None
+        Gamma a veces devuelve list directamente o envuelve en dict (depende de endpoint/versión).
+        Intentamos manejar ambos.
+        """
+        candidates: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            candidates = [x for x in data if isinstance(x, dict)]
+        elif isinstance(data, dict):
+            # posibles claves típicas
+            for k in ("markets", "data", "results"):
+                if isinstance(data.get(k), list):
+                    candidates = [x for x in data[k] if isinstance(x, dict)]
+                    break
+            if not candidates:
+                # a veces el dict ya es el market
+                if data.get("slug") == slug:
+                    return data
 
-        # If Gamma gives obvious activity flags, respect them.
-        if m.get("closed") is True:
-            return None
-        if m.get("active") is False:
-            return None
+        # exact match
+        for m in candidates:
+            if m.get("slug") == slug:
+                return m
 
-        if not self._is_binary_yes_no_market(m):
-            return None
+        # si no hay exact match, a veces slug viene dentro de la URL o parecido; devolvemos el más cercano
+        if candidates:
+            return candidates[0]
 
-        token_ids = self._parse_clob_token_ids(m.get("clobTokenIds"))
-        if len(token_ids) < 2:
-            return None
+        return None
 
-        # There isn't always a guaranteed ordering in clobTokenIds, but in practice
-        # for Yes/No markets Gamma returns [YES, NO]. If this ever flips, we will
-        # detect it later via price sanity checks (YES ask + NO ask should be ~1).
-        return (token_ids[0], token_ids[1])
+    def resolve_slug_to_yes_no_token_ids(self, slug: str) -> tuple[str, str]:
+        """
+        Devuelve (yes_token_id, no_token_id).
+        Si no se puede resolver, levanta ValueError con motivo claro.
+        """
+        market = self.gamma_get_market_by_slug(slug)
+        if not market:
+            raise ValueError(f"Gamma: no encuentro market para slug='{slug}'")
+
+        # outcomes puede venir como JSON string o como lista
+        outcomes = market.get("outcomes")
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = None
+
+        if not isinstance(outcomes, list) or not outcomes:
+            raise ValueError(f"Gamma: market slug='{slug}' no trae outcomes parseables")
+
+        # Buscar YES/NO
+        yes = None
+        no = None
+
+        for o in outcomes:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or o.get("outcome") or "").strip().upper()
+            tok = o.get("token_id") or o.get("tokenId") or o.get("clobTokenId") or o.get("id")
+            if not tok:
+                continue
+
+            if name == "YES":
+                yes = str(tok)
+            elif name == "NO":
+                no = str(tok)
+
+        if not yes or not no:
+            # Si Gamma no etiqueta claramente, intentamos por orden (2 outcomes)
+            if len(outcomes) == 2:
+                a = outcomes[0]
+                b = outcomes[1]
+                ta = a.get("token_id") or a.get("tokenId") or a.get("clobTokenId") or a.get("id")
+                tb = b.get("token_id") or b.get("tokenId") or b.get("clobTokenId") or b.get("id")
+                if ta and tb:
+                    # asumimos outcomes[0]=YES outcomes[1]=NO si no hay nombres
+                    yes = str(ta)
+                    no = str(tb)
+
+        if not yes or not no:
+            raise ValueError(f"Gamma: no pude extraer token_ids YES/NO para slug='{slug}'")
+
+        return yes, no
+
+    # ---------- CLOB (book) ----------
+
+    def get_order_book_summary(self, token_id: str) -> BookSummary:
+        """
+        Usa /book del CLOB (public).
+        Nos quedamos con best ask (si existe).
+        """
+        base = "https://clob.polymarket.com/book"
+        data = self._get_json(base, params={"token_id": token_id})
+
+        asks = data.get("asks") if isinstance(data, dict) else None
+        best = None
+
+        if isinstance(asks, list) and asks:
+            # cada ask suele ser dict con price/size como strings
+            top = asks[0]
+            if isinstance(top, dict) and top.get("price") is not None and top.get("size") is not None:
+                try:
+                    best = BookLevel(price=float(top["price"]), size=float(top["size"]))
+                except Exception:
+                    best = None
+
+        return BookSummary(best_ask=best)
