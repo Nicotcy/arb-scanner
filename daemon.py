@@ -206,9 +206,9 @@ def main() -> int:
 
     resolved_mappings: list[MarketMapping] = []
     if args.use_mapping:
-        mappings = load_manual_mappings()
-        if not mappings:
-            raise SystemExit("No manual mappings defined yet. Add .data/mappings.json (or implement mappings.py loader).")
+    mappings = load_manual_mappings()
+    if not mappings:
+        raise SystemExit("No manual mappings defined yet. Add .data/mappings.json (or implement mappings.py loader).")
 
     try:
         resolved = resolve_polymarket_tokens(mappings)
@@ -222,23 +222,16 @@ def main() -> int:
         m for m in resolved
         if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)
     ]
+
     if unresolved and resolved_ok:
         print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
         for m in unresolved:
             print(f" - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
         raise SystemExit(2)
 
-        unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
-        if unresolved:
-            print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
-            for m in unresolved:
-                print(f"  - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
-            raise SystemExit(2)
+    resolved_mappings = resolved
+    print(f"[daemon] loaded mappings={len(resolved_mappings)} (slug-only ok={not resolved_ok})")
 
-        resolved_mappings = resolved
-        print(f"[daemon] loaded mappings={len(resolved_mappings)} (all resolved yes/no token ids)")
-
-    print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
 
     last_prune_ts = 0
     last_settle_ts = 0
