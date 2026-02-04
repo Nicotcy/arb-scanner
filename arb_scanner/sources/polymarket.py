@@ -1,131 +1,172 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Any
+
+import requests
 
 from arb_scanner.mappings import MarketMapping
 from arb_scanner.models import Market, MarketSnapshot, OrderBookTop
-from arb_scanner.polymarket_public import PolymarketPublicClient
 from arb_scanner.sources.base import MarketDataProvider
 
 
 @dataclass
 class PolymarketStats:
     total_mappings: int = 0
-    resolved: int = 0
-    missing_tokens: int = 0
-    book_errors: int = 0
-    noprices: int = 0
+    gamma_ok: int = 0
+    gamma_not_found: int = 0
+    gamma_errors: int = 0
+    missing_prices: int = 0
     ok: int = 0
 
 
 class PolymarketProvider(MarketDataProvider):
     """
-    Read-only Polymarket provider using public CLOB + Gamma APIs.
+    Polymarket provider (READ-ONLY) usando SOLO Gamma API.
 
-    Diseño consciente:
-    - No se escanea todo Polymarket.
-    - Solo se consultan los markets definidos en mappings.json.
-    - Esto es suficiente (y necesario) para arbitraje cross-venue.
+    Por qué:
+    - En tu entorno, los endpoints públicos del CLOB (/book, /price) devuelven 404 siempre.
+    - Gamma sí responde y trae outcomePrices / bestAsk / question, suficiente para snapshots y cross-venue.
+
+    Limitación consciente:
+    - Esto NO es top-of-book real del CLOB. Lo tratamos como precio indicativo (size=0).
     """
+
+    GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
     def __init__(self, mappings: list[MarketMapping]) -> None:
         self.mappings = list(mappings)
-        self.client = PolymarketPublicClient()
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "arb-scanner/1.0 (read-only)", "Accept": "application/json"}
+        )
         self._question_cache: dict[str, str] = {}
 
     def name(self) -> str:
         return "Polymarket"
 
-    def _get_question_for_slug(self, slug: str) -> str:
+    def _gamma_get_market_by_slug(self, slug: str) -> dict[str, Any] | None:
+        # Gamma suele devolver lista de markets
+        r = self.session.get(
+            self.GAMMA_URL,
+            params={"slug": slug, "limit": 10, "offset": 0},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if isinstance(data, list):
+            for m in data:
+                if isinstance(m, dict) and m.get("slug") == slug:
+                    return m
+            return data[0] if data else None
+
+        if isinstance(data, dict):
+            # por si la API cambia y devuelve dict
+            if data.get("slug") == slug:
+                return data
+            for k in ("markets", "data", "results"):
+                v = data.get(k)
+                if isinstance(v, list) and v:
+                    for m in v:
+                        if isinstance(m, dict) and m.get("slug") == slug:
+                            return m
+                    return v[0] if v else None
+
+        return None
+
+    def _extract_yes_no_prices(self, market: dict[str, Any]) -> tuple[float, float] | None:
+        """
+        Preferimos outcomePrices porque es binario y directo.
+        outcomes suele ser ["Yes","No"] y outcomePrices ["0.65","0.35"] (strings).
+        """
+        outcomes = market.get("outcomes")
+        prices = market.get("outcomePrices")
+
+        if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices) and len(prices) >= 2:
+            # mapeo por nombre si existe
+            name_to_price: dict[str, float] = {}
+            for name, p in zip(outcomes, prices):
+                if name is None or p is None:
+                    continue
+                try:
+                    name_to_price[str(name).strip().upper()] = float(p)
+                except Exception:
+                    continue
+
+            y = name_to_price.get("YES")
+            n = name_to_price.get("NO")
+            if y is not None and n is not None:
+                return y, n
+
+            # fallback por orden típico (Yes, No)
+            try:
+                return float(prices[0]), float(prices[1])
+            except Exception:
+                return None
+
+        # fallback: a veces hay bestAsk (pero suele ser único / no por outcome)
+        # Si bestAsk existe y spread existe, no podemos inferir NO de forma fiable → no lo usamos
+        return None
+
+    def _get_question_for_slug(self, slug: str, market: dict[str, Any] | None) -> str:
         if slug in self._question_cache:
             return self._question_cache[slug]
-
-        try:
-            market = self.client.gamma_get_market_by_slug(slug)
-        except Exception:
-            market = None
-
-        question = None
+        q = None
         if isinstance(market, dict):
-            question = (
-                market.get("question")
-                or market.get("title")
-                or market.get("name")
-            )
-
-        if not question:
-            question = slug
-
-        question = str(question)
-        self._question_cache[slug] = question
-        return question
-
-    def _resolve_tokens(self, mapping: MarketMapping) -> tuple[str, str] | None:
-        if mapping.polymarket_yes_token_id and mapping.polymarket_no_token_id:
-            return mapping.polymarket_yes_token_id, mapping.polymarket_no_token_id
-
-        try:
-            return self.client.resolve_slug_to_yes_no_token_ids(
-                mapping.polymarket_slug
-            )
-        except Exception:
-            return None
+            q = market.get("question") or market.get("title") or market.get("name")
+        if not q:
+            q = slug
+        q = str(q)
+        self._question_cache[slug] = q
+        return q
 
     def fetch_market_snapshots(self) -> Iterable[MarketSnapshot]:
         stats = PolymarketStats(total_mappings=len(self.mappings))
 
         for mp in self.mappings:
-            tokens = self._resolve_tokens(mp)
-            if not tokens:
-                stats.missing_tokens += 1
+            slug = mp.polymarket_slug
+            if not slug:
+                stats.gamma_not_found += 1
                 continue
-
-            yes_token, no_token = tokens
-            stats.resolved += 1
 
             try:
-                yes_book = self.client.get_order_book_summary(yes_token)
-                no_book = self.client.get_order_book_summary(no_token)
+                market_raw = self._gamma_get_market_by_slug(slug)
+                if not market_raw:
+                    stats.gamma_not_found += 1
+                    continue
+                stats.gamma_ok += 1
             except Exception:
-                stats.book_errors += 1
+                stats.gamma_errors += 1
                 continue
 
-            if yes_book.best_ask is None or no_book.best_ask is None:
-                stats.noprices += 1
+            prices = self._extract_yes_no_prices(market_raw)
+            if not prices:
+                stats.missing_prices += 1
                 continue
 
-            yes_price = float(yes_book.best_ask.price)
-            no_price = float(no_book.best_ask.price)
-            yes_size = float(yes_book.best_ask.size)
-            no_size = float(no_book.best_ask.size)
+            yes_price, no_price = prices
 
-            orderbook = OrderBookTop(
-                best_yes_price=yes_price,
-                best_yes_size=yes_size,
-                best_no_price=no_price,
-                best_no_size=no_size,
+            ob = OrderBookTop(
+                best_yes_price=float(yes_price),
+                best_yes_size=0.0,  # Gamma no es orderbook: size desconocido
+                best_no_price=float(no_price),
+                best_no_size=0.0,
             )
 
             market = Market(
                 venue="Polymarket",
-                market_id=mp.polymarket_slug,
-                question=self._get_question_for_slug(mp.polymarket_slug),
+                market_id=slug,
+                question=self._get_question_for_slug(slug, market_raw),
                 outcomes=("YES", "NO"),
             )
 
             stats.ok += 1
-            yield MarketSnapshot(
-                market=market,
-                orderbook=orderbook,
-            )
+            yield MarketSnapshot(market=market, orderbook=ob)
 
         print(
             "PolymarketProvider stats: "
-            f"mappings={stats.total_mappings} "
-            f"ok={stats.ok} "
-            f"resolved={stats.resolved} "
-            f"missing_tokens={stats.missing_tokens} "
-            f"book_errors={stats.book_errors} "
-            f"noprices={stats.noprices}"
+            f"mappings={stats.total_mappings} ok={stats.ok} "
+            f"gamma_ok={stats.gamma_ok} not_found={stats.gamma_not_found} "
+            f"errors={stats.gamma_errors} missing_prices={stats.missing_prices}"
         )
