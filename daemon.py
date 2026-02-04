@@ -210,33 +210,27 @@ def main() -> int:
         if not mappings:
             raise SystemExit("No manual mappings defined yet. Add .data/mappings.json (or implement mappings.py loader).")
 
+        # Blindaje: si Gamma/token resolver falla, seguimos en modo slug-only (no matamos el daemon).
         try:
-        resolved = resolve_polymarket_tokens(mappings)
-        resolved_ok = True
-    except Exception as e:
-        print(f"[warn] resolve_polymarket_tokens skipped (continuing with slugs only): {e}")
-        resolved = mappings
-        resolved_ok = False
+            resolved = resolve_polymarket_tokens(mappings)
+            resolved_ok = True
+        except Exception as e:
+            print(f"[warn] resolve_polymarket_tokens skipped (continuing with slugs only): {e}")
+            resolved = mappings
+            resolved_ok = False
 
-    unresolved = [
-        m for m in resolved
-        if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)
-    ]
-    if unresolved and resolved_ok:
-        print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
-        for m in unresolved:
-            print(f" - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
-        raise SystemExit(2)
-
-        unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
-        if unresolved:
+        unresolved = [
+            m for m in resolved
+            if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)
+        ]
+        if unresolved and resolved_ok:
             print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
             for m in unresolved:
-                print(f"  - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
+                print(f" - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
             raise SystemExit(2)
 
         resolved_mappings = resolved
-        print(f"[daemon] loaded mappings={len(resolved_mappings)} (all resolved yes/no token ids)")
+        print(f"[daemon] loaded mappings={len(resolved_mappings)} (slug-only ok={not resolved_ok})")
 
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
 
