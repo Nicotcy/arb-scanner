@@ -210,16 +210,28 @@ def main() -> int:
         if not mappings:
             raise SystemExit("No manual mappings defined yet. Add .data/mappings.json (or implement mappings.py loader).")
 
-        resolved = resolve_polymarket_tokens(mappings)
-        unresolved = [m for m in resolved if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)]
-        if unresolved:
-            print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
-            for m in unresolved:
-                print(f"  - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
-            raise SystemExit(2)
+        try:
+    resolved = resolve_polymarket_tokens(mappings)
+    resolved_ok = True
+except Exception as e:
+    print(f"[warn] resolve_polymarket_tokens skipped (continuing with slugs only): {e}")
+    resolved = mappings
+    resolved_ok = False
 
-        resolved_mappings = resolved
-        print(f"[daemon] loaded mappings={len(resolved_mappings)} (all resolved yes/no token ids)")
+# Si Gamma resolvió "de verdad" pero aún faltan tokens, entonces sí abortamos.
+# Si NO resolvió (resolved_ok=False), seguimos en modo slug-only.
+unresolved = [
+    m for m in resolved
+    if not (m.polymarket_yes_token_id and m.polymarket_no_token_id)
+]
+if unresolved and resolved_ok:
+    print("Some mappings could not be resolved (Gamma) OR are not strict Yes/No binaries. Fix these slugs:")
+    for m in unresolved:
+        print(f" - {m.polymarket_slug} (kalshi={m.kalshi_ticker})")
+    raise SystemExit(2)
+
+resolved_mappings = resolved
+print(f"[daemon] loaded mappings={len(resolved_mappings)} (slug-only ok={not resolved_ok})")
 
     print(f"[daemon] run_id={run_id} mode={config.mode} db={args.db_path}")
 
